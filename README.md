@@ -1,7 +1,7 @@
 # Infinite-Canvas
 Supports comfyui/API calls/modelscope calls
 
-详细教程：https://youtu.be/1y9ShTvgC_w
+详细教程：[https://youtu.be/1y9ShTvgC_w](https://youtu.be/r_y_9ALr7fg)
 
 由于最近很多API网址关停，我找到一个稳定的网址：
 
@@ -34,7 +34,7 @@ https://apimart.ai/register?aff=1uyAbb
    
 -----
 
-Detailed tutorial: https://youtu.be/1y9ShTvgC_w
+Detailed tutorial: [https://youtu.be/1y9ShTvgC_w](https://youtu.be/r_y_9ALr7fg)
 
 Due to the recent shutdown of many API websites, I found a stable one:
 
