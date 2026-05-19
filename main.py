@@ -187,6 +187,17 @@ NEXT_TASK_ID = 1
 
 PROVIDER_ID_RE = re.compile(r"^[a-zA-Z0-9_-]{2,40}$")
 
+def ensure_runtime_config_files():
+    """首次运行时提前创建配置目录，避免第一次保存 API Key 时才创建目录/文件。"""
+    try:
+        os.makedirs(os.path.dirname(API_ENV_FILE), exist_ok=True)
+        os.makedirs(DATA_DIR, exist_ok=True)
+        if not os.path.exists(API_ENV_FILE):
+            with open(API_ENV_FILE, "a", encoding="utf-8"):
+                pass
+    except Exception as e:
+        print(f"初始化 API 配置目录失败: {e}")
+
 def load_env_file():
     if not os.path.exists(API_ENV_FILE):
         return
@@ -202,7 +213,7 @@ def load_env_file():
                 os.environ.setdefault(key, value)
     except Exception as e:
         print(f"加载 API/.env 失败: {e}")
-
+ensure_runtime_config_files()
 load_env_file()
 
 COMFYUI_INSTANCES = [s.strip() for s in os.getenv("COMFYUI_INSTANCES", "127.0.0.1:8188").split(",") if s.strip()]
@@ -381,6 +392,9 @@ def default_api_providers():
             "id": "modelscope",
             "name": "ModelScope",
             "base_url": MODELSCOPE_CHAT_BASE_URL,
+            "protocol": "openai",
+            "image_generation_endpoint": "",
+            "image_edit_endpoint": "",
             "enabled": True,
             "primary": False,
             "image_models": MODELSCOPE_DEFAULT_IMAGE_MODELS,
@@ -457,6 +471,32 @@ def normalize_ms_loras(values):
         })
     return normalized
 
+def normalize_endpoint_override(value, label):
+    endpoint = str(value or "").strip()
+    if not endpoint:
+        return ""
+    if len(endpoint) > 300 or re.search(r"\s", endpoint):
+        raise HTTPException(status_code=400, detail=f"{label} 不合法，请填写类似 /v1/images/edits 的路径")
+    if re.match(r"^https?://", endpoint, re.I):
+        return endpoint.rstrip("/")
+    if not endpoint.startswith("/"):
+        raise HTTPException(status_code=400, detail=f"{label} 需要以 /v1/... 开头，或填写完整 http(s) 地址")
+    return endpoint
+
+def provider_endpoint_url(provider, key, default_path):
+    base_url = str((provider or {}).get("base_url") or AI_BASE_URL).strip().rstrip("/")
+    override = str((provider or {}).get(key) or "").strip()
+    if override:
+        if re.match(r"^https?://", override, re.I):
+            return override.rstrip("/")
+        parsed = urllib.parse.urlsplit(base_url)
+        if parsed.scheme and parsed.netloc:
+            return f"{parsed.scheme}://{parsed.netloc}{override}"
+        return override
+    if base_url.endswith("/v1") and default_path.startswith("/v1/"):
+        return f"{base_url}{default_path[3:]}"
+    return f"{base_url}{default_path}"
+
 def normalize_provider(item):
     provider_id = str(item.get("id") or "").strip().lower()
     if not PROVIDER_ID_RE.fullmatch(provider_id):
@@ -468,11 +508,15 @@ def normalize_provider(item):
     protocol = str(item.get("protocol") or "openai").strip().lower()
     if protocol not in {"openai", "apimart"}:
         protocol = "openai"
+    image_generation_endpoint = normalize_endpoint_override(item.get("image_generation_endpoint"), "文生图端口")
+    image_edit_endpoint = normalize_endpoint_override(item.get("image_edit_endpoint"), "图生图/编辑端口")
     return {
         "id": provider_id,
         "name": name,
         "base_url": base_url,
         "protocol": protocol,
+        "image_generation_endpoint": image_generation_endpoint,
+        "image_edit_endpoint": image_edit_endpoint,
         "enabled": bool(item.get("enabled", True)),
         "primary": bool(item.get("primary", False)),
         "image_models": model_list_from_values(item.get("image_models") or []),
@@ -664,6 +708,8 @@ class ApiProviderPayload(BaseModel):
     name: str = ""
     base_url: str = ""
     protocol: str = "openai"
+    image_generation_endpoint: str = ""
+    image_edit_endpoint: str = ""
     enabled: bool = True
     primary: bool = False
     image_models: List[str] = []
@@ -672,6 +718,7 @@ class ApiProviderPayload(BaseModel):
     ms_loras: List[Dict[str, Any]] = []
     ms_defaults_version: int = 0
     api_key: Optional[str] = None
+    clear_key: bool = False
 
 class ChatRequest(BaseModel):
     conversation_id: str = ""
@@ -1131,7 +1178,7 @@ def extract_image(data):
     if isinstance(data.get("data"), dict) and isinstance(data["data"].get("data"), dict):
         data = data["data"]["data"]
     images = data.get("data") or []
-    if not images:
+    if not isinstance(images, list) or not images:
         raise HTTPException(status_code=502, detail="生图接口没有返回图片数据")
     first = images[0]
     if first.get("url"):
@@ -1153,6 +1200,10 @@ def extract_task_id(data):
     if isinstance(nested, dict):
         return extract_task_id(nested)
     return None
+
+def images_api_unsupported(response):
+    text = str(getattr(response, "text", "") or "").lower()
+    return "images api is not supported" in text or "not supported for this platform" in text
 
 def provider_protocol(provider):
     return str((provider or {}).get("protocol") or "openai").strip().lower()
@@ -1649,41 +1700,58 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
         return await generate_modelscope_provider_image(prompt, size, model, reference_images, provider)
     is_gpt2 = is_gpt_image_2_model(model)
     is_apimart = is_apimart_provider(provider)
+    quality = str(quality or "").strip().lower()
+    if quality not in {"low", "medium", "high"}:
+        quality = ""
     if is_gpt_image_2_model(model) and not is_apimart:
         size = normalize_gpt_image_2_size(size)
     base_url = (provider.get("base_url") or AI_BASE_URL).rstrip("/")
     if not base_url:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider['id']} 未配置 Base URL")
-    gen_url = f"{base_url}/images/generations" if base_url.endswith("/v1") else f"{base_url}/v1/images/generations"
-    edit_url = f"{base_url}/images/edits" if base_url.endswith("/v1") else f"{base_url}/v1/images/edits"
+    gen_url = provider_endpoint_url(provider, "image_generation_endpoint", "/v1/images/generations")
+    edit_url = provider_endpoint_url(provider, "image_edit_endpoint", "/v1/images/edits")
     refs = [ref for ref in (reference_images or []) if ref.get("url")]
     mask_refs = [ref for ref in refs if str(ref.get("role") or "").strip().lower() == "mask" or str(ref.get("name") or "").lower().endswith("_mask.png")]
     image_refs = [ref for ref in refs if ref not in mask_refs]
     request_timeout = httpx.Timeout(connect=20.0, read=600.0, write=120.0, pool=20.0) if (is_gpt2 or is_apimart) else AI_REQUEST_TIMEOUT
     async with httpx.AsyncClient(timeout=request_timeout) as client:
         response = None
+        async def post_openai_edits(edit_files=None):
+            data = {"model": model, "prompt": prompt, "size": size}
+            if quality:
+                data["quality"] = quality
+            return await client.post(
+                edit_url,
+                headers=api_headers(json_body=False, provider=provider),
+                data=data,
+                files=edit_files if edit_files is not None else {},
+            )
+
         if is_apimart:
             apimart_size, resolution = apimart_size_resolution(size)
+            # APIMart 的 GPT-Image-2 图生图仍走 /images/generations，
+            # 通过 image_urls 传参考图，不使用 OpenAI multipart /images/edits。
             body = {
                 "model": model,
                 "prompt": prompt,
                 "n": 1,
                 "size": apimart_size,
-                "resolution": resolution.upper(),
+                "resolution": resolution,
                 "official_fallback": False,
             }
             if image_refs:
-                body["image_urls"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:14]]
+                body["image_urls"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:16]]
             response = await client.post(gen_url, headers=api_headers(provider=provider), json=body)
-        elif is_gpt2 and not mask_refs:
+        elif is_gpt2 and not image_refs and not mask_refs:
             body = {"model": model, "prompt": prompt, "size": size}
             if quality:
                 body["quality"] = quality
-            if image_refs:
-                body["image"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:4]]
             response = await client.post(gen_url, headers=api_headers(provider=provider), json=body)
+            if response.status_code >= 400 and images_api_unsupported(response):
+                response = await post_openai_edits()
         elif image_refs:
-            # 1) 先用 multipart 提交到 /images/edits（OpenAI / Comfly 风格）
+            # 1) OpenAI 协议的图生图/编辑用 multipart 提交到 /images/edits；
+            # GPT-Image-2 参考图不能走 /images/generations JSON，否则部分平台会忽略原图或报 Images API unsupported。
             files = []
             opened = []
             edit_failed_status = None
@@ -1702,9 +1770,8 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                         fh = open(mask_path, "rb")
                         opened.append(fh)
                         files.append(("mask", (os.path.basename(mask_path), fh, content_type_for_path(mask_path))))
-                data = {"model": model, "prompt": prompt, "size": size, "quality": quality, "response_format": "url", "n": "1"}
                 try:
-                    response = await client.post(edit_url, headers=api_headers(json_body=False, provider=provider), data=data, files=files)
+                    response = await post_openai_edits(files)
                     if response.status_code >= 400:
                         edit_failed_status = response.status_code
                         edit_failed_text = response.text[:500]
@@ -1716,22 +1783,39 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             finally:
                 for fh in opened:
                     fh.close()
-            # 2) edits 失败 → 回退到 /images/generations + JSON image:[urls/base64]（grsai 风格）
+            # 2) edits 失败 → 非 GPT-Image-2 可回退到 /images/generations + JSON image:[urls/base64]（grsai 风格）
             if response is None:
+                if is_gpt2:
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"GPT-Image-2 编辑接口 /images/edits 调用失败：{edit_failed_text[:300] or edit_failed_status}"
+                    )
                 print(f"/images/edits failed ({edit_failed_status}): {edit_failed_text[:200]} → 回退到 /images/generations + image:[] JSON")
                 image_payload = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:4]]
                 body = {
                     "model": model, "prompt": prompt, "size": size,
-                    "quality": quality, "response_format": "url", "n": 1,
+                    "response_format": "url", "n": 1,
                     "image": image_payload,
                 }
+                if quality:
+                    body["quality"] = quality
                 response = await client.post(gen_url, headers=api_headers(provider=provider), json=body)
+                if response.status_code >= 400 and images_api_unsupported(response):
+                    raise HTTPException(
+                        status_code=502,
+                        detail=f"编辑接口 /images/edits 调用失败，且该平台不支持 /images/generations：{edit_failed_text[:300] or edit_failed_status}"
+                    )
         else:
+            body = {"model": model, "prompt": prompt, "size": size, "response_format": "url", "n": 1}
+            if quality:
+                body["quality"] = quality
             response = await client.post(
                 gen_url,
                 headers=api_headers(provider=provider),
-                json={"model": model, "prompt": prompt, "size": size, "quality": quality, "response_format": "url", "n": 1},
+                json=body,
             )
+            if response.status_code >= 400 and images_api_unsupported(response):
+                response = await post_openai_edits()
         response.raise_for_status()
         raw = response.json()
         try:
@@ -1877,8 +1961,11 @@ async def save_providers(payload: List[ApiProviderPayload]):
         if any(existing["id"] == provider["id"] for existing in providers):
             raise HTTPException(status_code=400, detail=f"API 平台 ID 重复：{provider['id']}")
         providers.append(provider)
-        if item.api_key is not None:
-            env_updates[provider_key_env(provider["id"])] = item.api_key.strip()
+        key_env = provider_key_env(provider["id"])
+        if item.clear_key:
+            env_updates[key_env] = ""
+        elif item.api_key is not None and item.api_key.strip():
+            env_updates[key_env] = item.api_key.strip()
         if provider["id"] == "comfly":
             env_updates["COMFLY_BASE_URL"] = provider["base_url"]
             env_updates["IMAGE_MODELS"] = ",".join(provider["image_models"])
@@ -3459,6 +3546,7 @@ class WorkflowField(BaseModel):
     max: Optional[float] = None
     step: Optional[float] = None
     options: List[str] = []
+    random_enabled: bool = False
 
 class WorkflowConfig(BaseModel):
     title: str = ""
