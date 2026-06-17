@@ -16,13 +16,13 @@
             } catch(e) {}
         })();
     </script>
-    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.06.15.1781551499"></script>
-    <script src="/static/vendor/js/lucide.js?v=2026.06.15.1781551499"></script>
-    <script src="/static/js/theme.js?v=2026.06.15.1781551499"></script>
-    <script src="/static/js/i18n.js?v=2026.06.15.1781551499"></script>
-    <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.15.1781551499">
+    <script src="/static/vendor/js/tailwindcss-cdn.js?v=2026.06.14.1779672342"></script>
+    <script src="/static/vendor/js/lucide.js?v=2026.06.14.1779672342"></script>
+    <script src="/static/js/theme.js?v=2026.06.14.1780456238"></script>
+    <script src="/static/js/i18n.js?v=2026.06.14.1780902932"></script>
+    <link rel="stylesheet" href="/static/css/theme.css?v=2026.06.14.1779672341">
     <style>
-        @import url('/static/vendor/css/fonts.css?v=2026.06.15.1781551499');
+        @import url('/static/vendor/css/fonts.css?v=2026.06.14.1779672342');
         :root {
             --ease:cubic-bezier(.4,0,.2,1);
             --chat-bg:#eef2f6;
@@ -188,6 +188,12 @@
         .image-controls { width:auto; display:flex; align-items:center; justify-content:flex-end; gap:6px; min-width:0; }
         .image-controls.hidden { display:none; }
         .resolution-picker { position:relative; z-index:24; width:238px; min-width:210px; max-width:270px; flex:0 0 238px; }
+        .resolution-picker.auto-mode { width:104px; min-width:104px; max-width:104px; flex-basis:104px; }
+        .resolution-picker.auto-mode .resolution-picker-button { grid-template-columns:18px minmax(0,1fr) 16px; gap:6px; padding:0 9px; }
+        .resolution-picker.auto-mode .resolution-picker-type,
+        .resolution-picker.auto-mode .resolution-picker-dot { display:none; }
+        .resolution-picker.auto-mode .resolution-picker-value { min-width:max-content; overflow:visible; text-overflow:clip; }
+        .resolution-picker.custom-mode { width:190px; min-width:180px; max-width:210px; flex-basis:190px; }
         .resolution-picker.open { z-index:80; }
         .resolution-picker-button { width:100%; height:36px; border-radius:12px; border:1px solid var(--chat-line); background:var(--chat-panel); color:var(--chat-text); display:grid; grid-template-columns:18px minmax(0,1fr) 16px; align-items:center; gap:8px; padding:0 10px; box-shadow:none; transition:background .16s var(--ease), border-color .16s var(--ease); }
         .resolution-picker-button:hover { background:var(--chat-soft); border-color:var(--chat-line-2); }
@@ -534,7 +540,7 @@
                                                 <span class="resolution-picker-labels">
                                                     <span id="resolutionPickerType" class="resolution-picker-type">尺寸</span>
                                                     <span class="resolution-picker-dot"></span>
-                                                    <span id="resolutionPickerValue" class="resolution-picker-value">1:1 · 1K · 1024x1024</span>
+                                                    <span id="resolutionPickerValue" class="resolution-picker-value">自动</span>
                                                 </span>
                                                 <i data-lucide="chevron-up"></i>
                                             </button>
@@ -542,11 +548,18 @@
                                                 <div class="resolution-picker-head">
                                                     <div class="resolution-picker-title">尺寸选择</div>
                                                     <div id="resolutionPickerScope" class="resolution-picker-scope">
-                                                        <button id="resolutionScopePreset" type="button" class="active" onclick="setResolutionPickerScope('preset')">内置</button>
+                                                        <button id="resolutionScopeAuto" type="button" class="active" onclick="setResolutionPickerScope('auto')">自动</button>
+                                                        <button id="resolutionScopePreset" type="button" onclick="setResolutionPickerScope('preset')">内置尺寸</button>
                                                         <button id="resolutionScopeCustom" type="button" onclick="setResolutionPickerScope('custom')">自定义</button>
                                                     </div>
                                                 </div>
-                                                <div id="resolutionPresetPane" class="resolution-picker-pane preset">
+                                                <div id="resolutionAutoPane" class="resolution-picker-pane custom">
+                                                    <div class="resolution-custom-box">
+                                                        <div class="resolution-custom-title">自动尺寸</div>
+                                                        <div class="resolution-custom-hint">默认 1024x1024；提示词包含比例或明确尺寸时自动匹配。</div>
+                                                    </div>
+                                                </div>
+                                                <div id="resolutionPresetPane" class="resolution-picker-pane preset hidden">
                                                     <div id="resolutionRatioList" class="resolution-picker-list">
                                                         <button id="chat-ratio-square" type="button" class="resolution-picker-option active" onclick="selectBuiltInRatio('square')"><span>1:1</span><small>正方形</small></button>
                                                         <button id="chat-ratio-portrait" type="button" class="resolution-picker-option" onclick="selectBuiltInRatio('portrait')"><span>2:3</span><small>竖图</small></button>
@@ -625,6 +638,7 @@
         const CHAT_SETTINGS_KEY = 'gpt_chat_settings_v1';
         const CHAT_LAST_CONVERSATION_KEY = 'gpt_chat_last_conversation_v1';
         const CHAT_ATTACHMENT_MAX = 20;
+        const CHAT_SIZE_MODE_VERSION = 2;
         const userId = localStorage.getItem(USER_KEY) || uuid();
         localStorage.setItem(USER_KEY, userId);
 
@@ -655,7 +669,7 @@
         let apiProviders = [];
         let chatProviderModels = isObject(savedChatSettings.chatProviderModels) ? savedChatSettings.chatProviderModels : {};
         let chatRatio = ['square','portrait','portrait43','landscape43','landscape','story','wide'].includes(savedChatSettings.chatRatio) ? savedChatSettings.chatRatio : 'square';
-        let chatResolution = ['1k','2k','4k','custom'].includes(savedChatSettings.chatResolution) ? savedChatSettings.chatResolution : '1k';
+        let chatResolution = savedChatSettings.chatSizeModeVersion === CHAT_SIZE_MODE_VERSION && ['auto','1k','2k','4k','custom'].includes(savedChatSettings.chatResolution) ? savedChatSettings.chatResolution : 'auto';
         let chatPresetResolution = ['1k','2k','4k'].includes(savedChatSettings.chatPresetResolution) ? savedChatSettings.chatPresetResolution : (chatResolution === 'custom' ? '1k' : chatResolution);
         let chatCustomSize = normalizeChatCustomSize(savedChatSettings.chatCustomSize || '') || '1024x1024';
         let modelPickerScope = savedChatSettings.modelPickerScope === 'image' ? 'image' : 'chat';
@@ -703,7 +717,8 @@
                     chatResolution,
                     chatPresetResolution,
                     chatCustomSize,
-                    modelPickerScope
+                    modelPickerScope,
+                    chatSizeModeVersion: CHAT_SIZE_MODE_VERSION
                 }));
             } catch(e) {}
         }
@@ -945,16 +960,30 @@
             const rect = btn.getBoundingClientRect();
             const viewportW = (window.visualViewport?.width || window.innerWidth);
             const viewportH = (window.visualViewport?.height || window.innerHeight);
-            const width = Math.min(420, Math.max(300, viewportW - 32));
-            const availableAbove = Math.max(210, rect.top - 14);
-            const maxHeight = Math.min(390, availableAbove, viewportH - 32);
-            const left = Math.min(Math.max(16, rect.left), Math.max(16, viewportW - width - 16));
-            const top = Math.max(12, rect.top - maxHeight - 10);
+            const desiredWidth = chatResolution === 'auto' ? 300 : (chatResolution === 'custom' ? 340 : 420);
+            const width = Math.min(desiredWidth, Math.max(260, viewportW - 32));
+            const safeX = 12;
+            const safeTop = 12;
+            const safeBottom = 18;
+            const gap = 10;
+            const left = Math.min(Math.max(safeX, rect.left + rect.width / 2 - width / 2), Math.max(safeX, viewportW - width - safeX));
+            const availableAbove = Math.max(96, rect.top - safeTop - gap);
+            const initialHeight = Math.min(chatResolution === 'auto' ? 220 : 390, availableAbove, viewportH - safeTop - safeBottom);
+            const initialTop = Math.max(safeTop, rect.top - initialHeight - gap);
             pop.style.setProperty('--resolution-picker-left', `${Math.round(left)}px`);
-            pop.style.setProperty('--resolution-picker-top', `${Math.round(Math.max(16, top))}px`);
+            pop.style.setProperty('--resolution-picker-top', `${Math.round(initialTop)}px`);
             pop.style.setProperty('--resolution-picker-width', `${Math.round(width)}px`);
-            pop.style.setProperty('--resolution-picker-max-height', `${Math.round(maxHeight)}px`);
+            pop.style.setProperty('--resolution-picker-max-height', `${Math.round(initialHeight)}px`);
+            pop.style.setProperty('--resolution-picker-list-height', '320px');
             requestAnimationFrame(() => {
+                const naturalHeight = Math.ceil(pop.scrollHeight || pop.getBoundingClientRect().height || 160);
+                const maxHeight = Math.max(96, Math.min(naturalHeight, availableAbove, viewportH - safeTop - safeBottom));
+                const headHeight = Math.ceil(pop.querySelector('.resolution-picker-head')?.getBoundingClientRect().height || 50);
+                const listHeight = Math.max(58, maxHeight - headHeight - 20);
+                const top = Math.max(safeTop, rect.top - maxHeight - gap);
+                pop.style.setProperty('--resolution-picker-max-height', `${Math.round(maxHeight)}px`);
+                pop.style.setProperty('--resolution-picker-list-height', `${Math.round(listHeight)}px`);
+                pop.style.setProperty('--resolution-picker-top', `${Math.round(top)}px`);
                 const box = pop.getBoundingClientRect();
                 const nextLeft = box.right > viewportW - 12 ? (left - (box.right - viewportW + 12)) : left;
                 const overlap = box.bottom - (rect.top - 8);
@@ -1138,7 +1167,7 @@
                 const match = SIZE_OPTIONS[next]?.find(([value]) => value === preferredSize);
                 if(match) chatPresetResolution = match[1];
             }
-            if(chatResolution !== 'custom') chatResolution = chatPresetResolution;
+            if(chatResolution !== 'auto' && chatResolution !== 'custom') chatResolution = chatPresetResolution;
             updateChatResolutionUI();
             saveChatSettings();
         }
@@ -1153,6 +1182,7 @@
         }
 
         function chatSizeForResolution(label = chatResolution){
+            if(label === 'auto') return '1024x1024';
             if(label === 'custom') return normalizeChatCustomSize(chatCustomSize) || '1024x1024';
             const options = SIZE_OPTIONS[chatRatio] || SIZE_OPTIONS.square;
             const match = options.find(([, item]) => item === label) || options[0];
@@ -1160,18 +1190,23 @@
         }
 
         function setChatResolution(next){
-            const normalized = ['1k','2k','4k','custom'].includes(next) ? next : '1k';
-            if(normalized !== 'custom') chatPresetResolution = normalized;
+            const normalized = ['auto','1k','2k','4k','custom'].includes(next) ? next : 'auto';
+            if(['1k','2k','4k'].includes(normalized)) chatPresetResolution = normalized;
             chatResolution = normalized;
             updateChatResolutionUI();
             saveChatSettings();
         }
 
         function setResolutionPickerScope(scope){
-            if(scope === 'custom') {
+            if(scope === 'auto') {
+                chatResolution = 'auto';
+                updateChatResolutionUI();
+                saveChatSettings();
+            } else if(scope === 'custom') {
                 setChatResolution('custom');
             } else {
                 chatResolution = chatPresetResolution || '1k';
+                if(chatResolution === 'auto') chatResolution = '1k';
                 chatPresetResolution = chatResolution;
                 updateChatResolutionUI();
                 saveChatSettings();
@@ -1184,7 +1219,6 @@
 
         function selectResolutionPreset(next){
             setChatResolution(next);
-            setResolutionPickerScope('preset');
         }
 
         function applyCustomResolution(){
@@ -1205,32 +1239,43 @@
             const typeEl = document.getElementById('resolutionPickerType');
             const valueEl = document.getElementById('resolutionPickerValue');
             const hint = document.getElementById('customResolutionHint');
+            const autoScopeBtn = document.getElementById('resolutionScopeAuto');
             const presetScopeBtn = document.getElementById('resolutionScopePreset');
             const customScopeBtn = document.getElementById('resolutionScopeCustom');
+            const autoPane = document.getElementById('resolutionAutoPane');
             const presetPane = document.getElementById('resolutionPresetPane');
             const customPane = document.getElementById('resolutionCustomPane');
+            const picker = document.getElementById('resolutionPicker');
+            if(!['1k','2k','4k'].includes(chatPresetResolution)) chatPresetResolution = '1k';
             const custom = normalizeChatCustomSize(chatCustomSize) || '1024x1024';
             if(chatCustomSize !== custom) chatCustomSize = custom;
             const currentSize = chatSizeForResolution();
             const ratioLabels = { square:'1:1', portrait:'2:3', portrait43:'3:4', landscape43:'4:3', landscape:'3:2', story:'9:16', wide:'16:9' };
             const ratioLabel = ratioLabels[chatRatio] || '1:1';
             const builtInLabel = `${ratioLabel} · ${chatPresetResolution.toUpperCase()} · ${chatSizeForResolution(chatPresetResolution)}`;
+            const isAuto = chatResolution === 'auto';
             const isCustom = chatResolution === 'custom';
             if(typeEl) typeEl.textContent = '尺寸';
-            if(valueEl) valueEl.textContent = isCustom ? `自定义 · ${currentSize}` : builtInLabel;
-            if(presetScopeBtn) presetScopeBtn.classList.toggle('active', !isCustom);
+            if(valueEl) valueEl.textContent = isAuto ? '自动' : (isCustom ? `自定义 · ${currentSize}` : builtInLabel);
+            if(picker){
+                picker.classList.toggle('auto-mode', isAuto);
+                picker.classList.toggle('custom-mode', isCustom);
+            }
+            if(autoScopeBtn) autoScopeBtn.classList.toggle('active', isAuto);
+            if(presetScopeBtn) presetScopeBtn.classList.toggle('active', !isAuto && !isCustom);
             if(customScopeBtn) customScopeBtn.classList.toggle('active', isCustom);
-            if(presetPane) presetPane.classList.toggle('hidden', isCustom);
+            if(autoPane) autoPane.classList.toggle('hidden', !isAuto);
+            if(presetPane) presetPane.classList.toggle('hidden', isAuto || isCustom);
             if(customPane) customPane.classList.toggle('hidden', !isCustom);
             ['1k','2k','4k'].forEach(label => {
                 const btn = document.querySelector(`.resolution-picker-option[data-resolution="${label}"]`);
                 const sizeEl = document.getElementById(`resolutionPreset${label}`);
-                if(btn) btn.classList.toggle('active', !isCustom && chatPresetResolution === label);
+                if(btn) btn.classList.toggle('active', !isAuto && !isCustom && chatPresetResolution === label);
                 if(sizeEl) sizeEl.textContent = chatSizeForResolution(label);
             });
             ['square','portrait','portrait43','landscape43','landscape','story','wide'].forEach(label => {
                 const btn = document.getElementById(`chat-ratio-${label}`);
-                if(btn) btn.classList.toggle('active', !isCustom && chatRatio === label);
+                if(btn) btn.classList.toggle('active', !isAuto && !isCustom && chatRatio === label);
             });
             const [w, h] = custom.split('x');
             const widthInput = document.getElementById('customResolutionWidth');
@@ -1238,6 +1283,9 @@
             if(widthInput && widthInput.value !== w) widthInput.value = w;
             if(heightInput && heightInput.value !== h) heightInput.value = h;
             if(hint && !hint.classList.contains('error')) hint.textContent = '输入 256-8192 之间的宽度和高度';
+            if(document.getElementById('resolutionPicker')?.classList.contains('open')) {
+                requestAnimationFrame(positionResolutionPicker);
+            }
             lucide.createIcons();
         }
 
@@ -1264,7 +1312,7 @@
             const wants2k = /2\s*k|2K|高清|高分辨率/i.test(text);
             if(chatResolution === 'custom' && !wants4k && !wants2k) return fallbackSize;
             const fallbackEdge = Math.max(...String(fallbackSize || '').split(/[xX×*]/).map(n => Number(n) || 0));
-            const targetLabel = wants4k || fallbackEdge >= 2400 ? '4k' : (wants2k || fallbackEdge >= 1500 ? '2k' : '1k');
+            const targetLabel = wants4k ? '4k' : (wants2k ? '2k' : (chatResolution === 'auto' ? '1k' : (fallbackEdge >= 2400 ? '4k' : (fallbackEdge >= 1500 ? '2k' : '1k'))));
             return (SIZE_OPTIONS[key] || SIZE_OPTIONS.square).find(([, label]) => label === targetLabel)?.[0] || fallbackSize;
         }
 

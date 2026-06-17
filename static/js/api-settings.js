@@ -58,14 +58,6 @@ const recommendApiList = document.getElementById('recommendApiList');
 const VOLCENGINE_DEFAULT_BASE_URL = 'https://ark.cn-beijing.volces.com/api/v3';
 const VOLCENGINE_DEFAULT_PROJECT_NAME = 'default';
 const VOLCENGINE_DEFAULT_REGION = 'cn-beijing';
-const VOLCENGINE_DEFAULT_VIDEO_MODELS = [
-    'doubao-seedance-2-0-260128',
-    'doubao-seedance-2-0-fast-260128',
-    'doubao-seedance-1-5-pro-251215',
-    'doubao-seedance-1-0-pro-250528',
-    'doubao-seedance-1-0-lite-t2v-250428',
-    'doubao-seedance-1-0-lite-i2v-250428'
-];
 const MS_BUILTIN_IMAGE_MODELS = [
     'Tongyi-MAI/Z-Image-Turbo',
     'Qwen/Qwen-Image-2512',
@@ -578,7 +570,7 @@ function applyProviderOnboardingDefaults(id){
     } else if(id === 'volcengine'){
         item.base_url = VOLCENGINE_DEFAULT_BASE_URL;
         item.protocol = 'volcengine';
-        item.video_models = unique([...(item.video_models || []), ...VOLCENGINE_DEFAULT_VIDEO_MODELS]);
+        item.video_models = unique(item.video_models || []);
         item.volcengine_project_name = item.volcengine_project_name || VOLCENGINE_DEFAULT_PROJECT_NAME;
         item.volcengine_region = item.volcengine_region || VOLCENGINE_DEFAULT_REGION;
     } else if(id === 'jimeng'){
@@ -2490,7 +2482,7 @@ function applyDetectedProtocol(protocol){
     item.protocol = detected;
     item.base_url = detected === 'jimeng' ? '' : (baseInput?.value.trim() || item.base_url || '');
     if(detected === 'volcengine'){
-        item.video_models = unique([...(item.video_models || []), ...VOLCENGINE_DEFAULT_VIDEO_MODELS]);
+        item.video_models = unique(item.video_models || []);
         item.volcengine_project_name = item.volcengine_project_name || VOLCENGINE_DEFAULT_PROJECT_NAME;
         item.volcengine_region = item.volcengine_region || VOLCENGINE_DEFAULT_REGION;
     }
@@ -3111,6 +3103,7 @@ async function loadProviders(){
         providers = data.providers || [];
         selectedId = sortedProviders()[0]?.id || '';
         renderEditor();
+        openRecommendApi();
         setStatus('');
     } catch(err) {
         setStatus(tr('api.loadFailed'));

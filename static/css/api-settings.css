@@ -4859,6 +4859,54 @@ html:not(.studio-theme-dark) body:not(.theme-dark) .recommend-badge {
     color:#5f6b7a !important;
 }
 
+/* 推荐平台卡片：收紧底部快速配置区高度 */
+.recommend-platform-card {
+    padding:12px !important;
+    gap:12px !important;
+}
+
+.recommend-platform-info {
+    gap:7px !important;
+}
+
+.recommend-platform-summary {
+    line-height:1.48 !important;
+}
+
+.recommend-platform-setup {
+    gap:6px !important;
+}
+
+.recommend-setup-flow {
+    gap:8px !important;
+}
+
+.recommend-guide-source,
+.recommend-guide-save {
+    min-height:52px !important;
+}
+
+.recommend-guide-save {
+    padding:7px 8px !important;
+    gap:8px !important;
+}
+
+.recommend-guide-save .onboarding-key-field span,
+.recommend-guide-source .onboarding-rh-source-label {
+    margin-bottom:4px !important;
+    font-size:10px !important;
+}
+
+.recommend-guide-save .onboarding-key-field input {
+    height:30px !important;
+}
+
+.recommend-guide-key-btn,
+.recommend-guide-save-btn {
+    height:32px !important;
+    min-height:32px !important;
+}
+
 body.studio-theme-dark .recommend-tag,
 body.studio-theme-dark .recommend-badge,
 html.studio-theme-dark body .recommend-tag,

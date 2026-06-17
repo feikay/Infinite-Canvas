@@ -314,14 +314,6 @@ except Exception:
 VOLCENGINE_DEFAULT_BASE_URL = "https://ark.cn-beijing.volces.com/api/v3"
 VOLCENGINE_DEFAULT_PROJECT_NAME = "default"
 VOLCENGINE_DEFAULT_REGION = "cn-beijing"
-VOLCENGINE_DEFAULT_VIDEO_MODELS = [
-    "doubao-seedance-2-0-260128",
-    "doubao-seedance-2-0-fast-260128",
-    "doubao-seedance-1-5-pro-251215",
-    "doubao-seedance-1-0-pro-250528",
-    "doubao-seedance-1-0-lite-t2v-250428",
-    "doubao-seedance-1-0-lite-i2v-250428",
-]
 RUNNINGHUB_DEFAULT_IMAGE_MODELS = [
     "gpt-image-2/text-to-image-official-stable",
     "gpt-image-2/image-to-image-official-stable",
@@ -520,6 +512,9 @@ AI_REQUEST_TIMEOUT = float(os.getenv("REQUEST_TIMEOUT", "1800"))
 IMAGE_POLL_INTERVAL = float(os.getenv("IMAGE_POLL_INTERVAL", "2"))
 IMAGE_TASK_TIMEOUT = float(os.getenv("IMAGE_TASK_TIMEOUT", str(AI_REQUEST_TIMEOUT)))
 COMFYUI_HISTORY_TIMEOUT = int(float(os.getenv("COMFYUI_HISTORY_TIMEOUT", "1800")))
+# 下载 ComfyUI 产物的 socket 超时（秒，作用于连接和每次 read）。没有它时一次网络卡顿会让 urlopen 永久挂起，
+# 导致 generate() 不返回、画布卡片一直转圈拿不到结果。给得足够大以容纳大视频/大图的正常下载。
+COMFYUI_DOWNLOAD_TIMEOUT = float(os.getenv("COMFYUI_DOWNLOAD_TIMEOUT", "120"))
 APIMART_IMAGE_TASK_TIMEOUT = float(os.getenv("APIMART_IMAGE_TASK_TIMEOUT", "1800"))
 APIMART_IMAGE_POLL_INTERVAL = float(os.getenv("APIMART_IMAGE_POLL_INTERVAL", "5"))
 APIMART_IMAGE_INITIAL_POLL_DELAY = float(os.getenv("APIMART_IMAGE_INITIAL_POLL_DELAY", "10"))
@@ -528,6 +523,7 @@ ONLINE_IMAGE_PROMPT_MAX_LENGTH = int(os.getenv("ONLINE_IMAGE_PROMPT_MAX_LENGTH",
 VIDEO_PROMPT_MAX_LENGTH = int(os.getenv("VIDEO_PROMPT_MAX_LENGTH", "4000"))
 LLM_MESSAGE_MAX_LENGTH = int(os.getenv("LLM_MESSAGE_MAX_LENGTH", "20000"))
 CHAT_ATTACHMENT_MAX = int(os.getenv("CHAT_ATTACHMENT_MAX", "20"))
+ONLINE_IMAGE_REFERENCE_MAX = int(os.getenv("ONLINE_IMAGE_REFERENCE_MAX", "20"))
 
 FIELD_LABELS = {
     "prompt": "提示词",
@@ -751,7 +747,7 @@ def default_api_providers():
             "primary": False,
             "image_models": [],
             "chat_models": [],
-            "video_models": VOLCENGINE_DEFAULT_VIDEO_MODELS,
+            "video_models": [],
             "ms_loras": [],
             "ms_defaults_version": 0,
             "volcengine_project_name": VOLCENGINE_DEFAULT_PROJECT_NAME,
@@ -807,7 +803,7 @@ def merge_default_api_providers(providers):
                     "base_url": legacy.get("base_url") or volc_default["base_url"],
                     "image_models": legacy_image_models or model_list_from_values(volc_default.get("image_models") or []),
                     "chat_models": model_list_from_values(legacy.get("chat_models") or []),
-                    "video_models": legacy_video_models or model_list_from_values(volc_default.get("video_models") or []),
+                    "video_models": legacy_video_models,
                 }
                 merged.append(current)
             else:
@@ -973,17 +969,14 @@ def apply_runninghub_system_thumbnails(entries, kind):
     return result
 
 def merge_runninghub_entry_overlay(system_entry, user_entry):
-    # 同 ID 的系统模板条目由模板主导：后续维护只更新 static/runninghub/api_providers.json 即可。
-    # 用户侧只保留启用/隐藏等管理状态；自定义新增条目不受影响。
+    # 系统模板只提供默认值；同 ID 的用户配置优先，允许用户修改/隐藏内置模板。
     if not isinstance(system_entry, dict):
         return user_entry
     if not isinstance(user_entry, dict):
         return system_entry
-    merged = dict(system_entry)
-    if "enabled" in user_entry:
-        merged["enabled"] = bool(user_entry.get("enabled", True))
-    if user_entry.get("hidden") is True:
-        merged["hidden"] = True
+    merged = {**system_entry, **user_entry}
+    if not merged.get("thumbnail") and system_entry.get("thumbnail"):
+        merged["thumbnail"] = system_entry.get("thumbnail")
     return merged
 
 def merge_runninghub_system_entries(system_entries, user_entries, kind):
@@ -2786,7 +2779,7 @@ def download_image(comfy_address, comfy_url_path, prefix="studio_"):
     local_path = output_path_for(filename, "output")
     full_url = f"http://{comfy_address}{comfy_url_path}"
     try:
-        with urllib.request.urlopen(full_url) as response, open(local_path, 'wb') as out_file:
+        with urllib.request.urlopen(full_url, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response, open(local_path, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
         return output_url_for(filename, "output")
     except Exception as e:
@@ -2853,7 +2846,7 @@ def download_comfy_output(comfy_address, item, prefix="studio_"):
     comfy_url_path = f"/view?filename={urllib.parse.quote(str(item['filename']))}&subfolder={subfolder}&type={file_type}"
     full_url = f"http://{comfy_address}{comfy_url_path}"
     try:
-        with urllib.request.urlopen(full_url) as response, open(local_path, 'wb') as out_file:
+        with urllib.request.urlopen(full_url, timeout=COMFYUI_DOWNLOAD_TIMEOUT) as response, open(local_path, 'wb') as out_file:
             shutil.copyfileobj(response, out_file)
         return output_url_for(filename, "output")
     except Exception as e:
@@ -3486,7 +3479,106 @@ def extract_image_flexible(value, depth=0):
             return found
     return None
 
+def extract_images(data):
+    found = []
+    seen = set()
+
+    def add_image(item):
+        if not isinstance(item, dict):
+            return
+        img_type = item.get("type") or "url"
+        value = item.get("value")
+        if not value:
+            return
+        key = (img_type, value)
+        if key in seen:
+            return
+        seen.add(key)
+        found.append(item)
+
+    def collect(value, depth=0):
+        if depth > 8 or value is None:
+            return
+        if isinstance(value, str):
+            if looks_like_generated_image_url(value):
+                add_image({"type": "url", "value": value})
+            return
+        if isinstance(value, list):
+            for item in value:
+                collect(item, depth + 1)
+            return
+        if not isinstance(value, dict):
+            return
+        for key in IMAGE_BASE64_KEY_HINTS:
+            item = value.get(key)
+            if isinstance(item, str) and item.strip():
+                add_image({
+                    "type": "b64",
+                    "value": item.strip(),
+                    "mime_type": value.get("mime_type") or value.get("mimeType") or "image/png",
+                })
+        for key in IMAGE_OUTPUT_KEY_HINTS:
+            item = value.get(key)
+            if isinstance(item, str) and looks_like_generated_image_url(item):
+                add_image({"type": "url", "value": item})
+            else:
+                collect(item, depth + 1)
+        for key in IMAGE_CONTAINER_KEY_HINTS:
+            collect(value.get(key), depth + 1)
+
+    candidates = data.get("candidates") if isinstance(data, dict) else None
+    if isinstance(candidates, list):
+        for candidate in candidates:
+            if not isinstance(candidate, dict):
+                continue
+            content = candidate.get("content") or {}
+            parts = content.get("parts") if isinstance(content, dict) else None
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if not isinstance(part, dict):
+                    continue
+                inline = part.get("inlineData") or part.get("inline_data") or {}
+                if not isinstance(inline, dict):
+                    continue
+                value = inline.get("data")
+                if value:
+                    add_image({
+                        "type": "b64",
+                        "value": value,
+                        "mime_type": inline.get("mimeType") or inline.get("mime_type") or "image/png",
+                    })
+
+    current = data
+    if isinstance(current, dict) and isinstance(current.get("data"), dict) and isinstance(current["data"].get("result"), dict):
+        current = current["data"]
+    if isinstance(current, dict) and isinstance(current.get("result"), dict):
+        for item in current["result"].get("images") or []:
+            if not isinstance(item, dict):
+                collect(item)
+                continue
+            url = item.get("url")
+            if isinstance(url, list):
+                for one in url:
+                    collect(one)
+            else:
+                collect(url)
+            collect(item)
+
+    collect(data)
+    if isinstance(data, dict) and isinstance(data.get("data"), dict) and isinstance(data["data"].get("data"), dict):
+        collect(data["data"]["data"])
+    if found:
+        return found
+    raise HTTPException(status_code=502, detail="无法识别生图接口返回格式")
+
 def extract_image(data):
+    try:
+        images = extract_images(data)
+        if images:
+            return images[0]
+    except HTTPException:
+        pass
     candidates = data.get("candidates") if isinstance(data, dict) else None
     if isinstance(candidates, list):
         for candidate in candidates:
@@ -7176,7 +7268,7 @@ async def generate_modelscope_provider_image(prompt, size, model, reference_imag
         raise HTTPException(status_code=400, detail="未配置 ModelScope API Key，请在 API 设置中填写。")
     width, height = parse_size_pair(size)
     refs = []
-    for ref in (reference_images or [])[:4]:
+    for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
         if not ref.get("url"):
             continue
         # 本地参考图转为 data URL；前端已生成的 data URL 保持原样，贴近旧版稳定链路。
@@ -7267,7 +7359,7 @@ async def generate_gemini_provider_image(prompt, size, model, reference_images=N
     model_name = gemini_model_name(model)
     endpoint = gemini_endpoint_url(provider, model_name)
     parts = [{"text": prompt.strip()}]
-    for ref in (reference_images or [])[:16]:
+    for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
         part = gemini_reference_part(ref)
         if part:
             parts.append(part)
@@ -7302,7 +7394,7 @@ async def generate_volcengine_provider_image(prompt, size, model, reference_imag
         "size": size,
         "response_format": "url",
     }
-    images = [volcengine_image_payload(ref) for ref in (reference_images or [])[:10]]
+    images = [volcengine_image_payload(ref) for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]]
     images = [value for value in images if value]
     if images:
         body["image"] = images
@@ -8150,7 +8242,7 @@ async def generate_runninghub_entry_image(prompt, model, reference_images, provi
     timeout = httpx.Timeout(connect=20.0, read=1800.0, write=240.0, pool=20.0)
     async with httpx.AsyncClient(timeout=timeout) as client:
         uploaded = []
-        for ref in (reference_images or [])[:10]:
+        for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
             ref_url = ref.get("url") if isinstance(ref, dict) else ref
             if not ref_url:
                 continue
@@ -8256,7 +8348,7 @@ async def generate_runninghub_provider_image(prompt, size, model, reference_imag
         body["quality"] = runninghub_schema_value(quality_field, "medium")
     async with httpx.AsyncClient(timeout=httpx.Timeout(connect=20.0, read=1800.0, write=180.0, pool=20.0)) as client:
         image_urls = []
-        for ref in (reference_images or [])[:10]:
+        for ref in (reference_images or [])[:ONLINE_IMAGE_REFERENCE_MAX]:
             url = await runninghub_upload_reference(client, provider, ref)
             if url:
                 image_urls.append(url)
@@ -8409,7 +8501,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             # 文生图只传 extra_body.response_format，图生图把参考图放进 extra_body.image。
             extra_body = {"response_format": "url"}
             if image_refs:
-                extra_body["image"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:16]]
+                extra_body["image"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]]
             body = {"model": model, "prompt": prompt, "size": size, "extra_body": extra_body}
             response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
         elif is_apimart:
@@ -8425,7 +8517,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                 "official_fallback": False,
             }
             if image_refs:
-                body["image_urls"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:16]]
+                body["image_urls"] = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]]
             response = await client.post(gen_url, headers=api_headers(provider=provider, model=model), json=body)
         elif is_gpt2 and not image_refs and not mask_refs:
             body = {"model": model, "prompt": prompt, "size": size}
@@ -8442,7 +8534,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
             edit_failed_status = None
             edit_failed_text = ""
             try:
-                for ref in image_refs[:4]:
+                for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]:
                     path = output_file_from_url(ref.get("url", ""))
                     if not path:
                         continue
@@ -8476,7 +8568,7 @@ async def generate_ai_image(prompt, size, quality, model, reference_images=None,
                         detail=f"GPT-Image-2 编辑接口 /images/edits 调用失败：{edit_failed_text[:300] or edit_failed_status}。已停止自动重试，避免上游可能已扣费后再次请求。"
                     )
                 print(f"/images/edits failed ({edit_failed_status}): {edit_failed_text[:200]} → 回退到 /images/generations + image:[] JSON")
-                image_payload = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:4]]
+                image_payload = [reference_to_data_url(ref, max_size=1536) for ref in image_refs[:ONLINE_IMAGE_REFERENCE_MAX]]
                 body = {
                     "model": model, "prompt": prompt, "size": size,
                     "response_format": "url", "n": 1,
@@ -10190,17 +10282,16 @@ def upstream_model_headers(api_key: str, protocol: str):
     return {"Authorization": bearer_auth_value(api_key), "Accept": "application/json"}
 
 def volcengine_default_model_payload(status=200, message="", raw=None):
-    models = VOLCENGINE_DEFAULT_VIDEO_MODELS[:]
     return {
         "ok": True,
         "protocol": "volcengine",
         "status": status,
-        "message": message or "方舟任务接口可用，模型列表接口未返回模型，已使用默认 Seedance 模型。",
-        "model_count": len(models),
+        "message": message or "方舟任务接口可用，模型列表接口未返回模型。请按实际方舟控制台模型名称手动填写视频模型。",
+        "model_count": 0,
         "image_models": [],
         "chat_models": [],
-        "video_models": models,
-        "all": models,
+        "video_models": [],
+        "all": [],
         "raw": raw,
     }
 
@@ -10418,12 +10509,12 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 if protocol == "volcengine":
                     detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                     if detected:
-                        message = f"{probe.get('message') or '方舟任务接口可达'}；但 /api/v3/models 不可用，已使用默认 Seedance 模型。"
+                        message = f"{probe.get('message') or '方舟任务接口可达'}；但 /api/v3/models 不可用。请按实际方舟控制台模型名称手动填写视频模型。"
                         return volcengine_default_model_payload(status=probe.get("status") or resp.status_code, message=message, raw={"models_error": resp.text[:300], **(probe.get("raw") or {})})
                 elif protocol == "openai":
                     detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                     if detected:
-                        message = f"{probe.get('message') or '检测到方舟/Ark 兼容入口'}；OpenAI /v1/models 不可用，已自动切换为方舟协议并使用默认 Seedance 模型。"
+                        message = f"{probe.get('message') or '检测到方舟/Ark 兼容入口'}；OpenAI /v1/models 不可用，已自动切换为方舟协议。请按实际方舟控制台模型名称手动填写视频模型。"
                         return volcengine_default_model_payload(status=probe.get("status") or resp.status_code, message=message, raw={"models_error": resp.text[:300], **(probe.get("raw") or {})})
                 return {"ok": False, "status": resp.status_code, "message": resp.text[:300]}
             data = resp.json() if resp.text else {}
@@ -10449,7 +10540,7 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 async with httpx.AsyncClient(timeout=15) as client:
                     detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                     if detected:
-                        message = f"{probe.get('message') or '方舟任务接口可达'}；但模型列表请求失败，已使用默认 Seedance 模型。"
+                        message = f"{probe.get('message') or '方舟任务接口可达'}；但模型列表请求失败。请按实际方舟控制台模型名称手动填写视频模型。"
                         return volcengine_default_model_payload(status=probe.get("status") or 0, message=message, raw={"models_error": str(e)[:300], **(probe.get("raw") or {})})
             except Exception:
                 pass
@@ -10540,6 +10631,24 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
 
             openai_ok, openai_probe = await probe_openai_models_endpoint(client, base_url, api_key)
             if not openai_ok and protocol == "openai":
+                # /v1/models 不可用，先确认是不是“没实现 models 接口的 OpenAI 兼容站”：探一下 /v1/chat/completions。
+                # 可达就判定为 OpenAI 兼容（很多网关不暴露 /v1/models），避免被下面的方舟探测（404 也算可达）误判成方舟。
+                compat_ok, compat_probe = await probe_openai_compat_bearer_endpoint(client, base_url, api_key)
+                # 仅当 /v1/chat/completions 确实存在（返回 2xx 或我们发空 messages 触发的 400 等，而非 404 路径不存在）
+                # 才判为 OpenAI 兼容；404 说明该路径不存在，留给后面的方舟探测。
+                if compat_ok and (compat_probe.get("status") or 0) != 404:
+                    return {
+                        "ok": True,
+                        "protocol": "openai",
+                        "status_code": compat_probe.get("status") or openai_probe.get("status") or sc,
+                        "message": "OpenAI 兼容入口可达（该站未提供 /v1/models，模型请手动填写）",
+                        "raw": {"async_probe": async_probe, "openai_probe": openai_probe.get("raw"), "openai_compat_probe": compat_probe.get("raw")},
+                        "model_count": 0,
+                        "image_models": [],
+                        "chat_models": [],
+                        "video_models": [],
+                        "all": [],
+                    }
                 detected, volc_probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                 if detected:
                     return {
@@ -10605,7 +10714,7 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
                     if detected:
                         payload = volcengine_default_model_payload(
                             status=probe.get("status") or resp.status_code,
-                            message=f"{probe.get('message') or '方舟任务接口可达'}；但 /api/v3/models 不可用，已使用默认 Seedance 模型。",
+                            message=f"{probe.get('message') or '方舟任务接口可达'}；但 /api/v3/models 不可用。请按实际方舟控制台模型名称手动填写视频模型。",
                             raw={"models_error": resp.text[:300], **(probe.get("raw") or {})},
                         )
                         return {
@@ -10623,7 +10732,7 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
                     if detected:
                         payload = volcengine_default_model_payload(
                             status=probe.get("status") or resp.status_code,
-                            message=f"{probe.get('message') or '检测到方舟/Ark 兼容入口'}；OpenAI /v1/models 不可用，已自动切换为方舟协议并使用默认 Seedance 模型。",
+                            message=f"{probe.get('message') or '检测到方舟/Ark 兼容入口'}；OpenAI /v1/models 不可用，已自动切换为方舟协议。请按实际方舟控制台模型名称手动填写视频模型。",
                             raw={"models_error": resp.text[:300], **(probe.get("raw") or {})},
                         )
                         return {
@@ -10646,7 +10755,7 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
                     if detected:
                         payload = volcengine_default_model_payload(
                             status=probe.get("status") or 0,
-                            message=f"{probe.get('message') or '方舟任务接口可达'}；但模型列表请求失败，已使用默认 Seedance 模型。",
+                            message=f"{probe.get('message') or '方舟任务接口可达'}；但模型列表请求失败。请按实际方舟控制台模型名称手动填写视频模型。",
                             raw={"models_error": str(e)[:300], **(probe.get("raw") or {})},
                         )
                         return {
@@ -10711,8 +10820,16 @@ async def build_online_image_result(payload: OnlineImageRequest):
     count = max(1, min(8, int(payload.n or 1)))
     async def generate_one():
         image_data, raw_item = await generate_ai_image(payload.prompt, payload.size, payload.quality, model, image_refs, provider["id"])
-        local_url = await save_ai_image_to_output(image_data, prefix="online_")
-        return local_url, raw_item
+        try:
+            image_items = extract_images(raw_item) if isinstance(raw_item, dict) else [image_data]
+        except HTTPException:
+            image_items = [image_data]
+        local_urls = []
+        for item in image_items:
+            local_url = await save_ai_image_to_output(item, prefix="online_")
+            if local_url:
+                local_urls.append(local_url)
+        return local_urls, raw_item
     try:
         generated = await asyncio.gather(*(generate_one() for _ in range(count)))
     except httpx.HTTPStatusError as exc:
@@ -10725,7 +10842,7 @@ async def build_online_image_result(payload: OnlineImageRequest):
         log_net_error(f"生图 网络/TLS错误 provider={provider.get('id')} model={model}", exc)
         raise HTTPException(status_code=502, detail=f"请求上游生图接口失败：{exc}") from exc
 
-    local_urls = [url for url, _raw in generated if url]
+    local_urls = [url for urls, _raw in generated for url in (urls or []) if url]
     raw = generated[0][1] if generated else {}
     if not local_urls:
         provider_name = provider.get("name") or provider["id"]
@@ -10770,17 +10887,21 @@ async def query_image_task(payload: ImageTaskQueryRequest):
         raise HTTPException(status_code=502, detail=f"查询上游生图任务失败：{exc}") from exc
 
     status = image_task_status(raw)
-    image_data = None
+    image_items = []
     try:
-        image_data = extract_image(raw)
+        image_items = extract_images(raw)
     except HTTPException:
-        image_data = None
-    if image_data:
-        local_url = await save_ai_image_to_output(image_data, prefix="online_")
+        image_items = []
+    if image_items:
+        local_urls = []
+        for item in image_items:
+            local_url = await save_ai_image_to_output(item, prefix="online_")
+            if local_url:
+                local_urls.append(local_url)
         result = {
             "status": "succeeded",
             "prompt": "",
-            "images": [local_url],
+            "images": local_urls,
             "timestamp": time.time(),
             "type": "online",
             "model": "",
@@ -10962,7 +11083,7 @@ def build_image_param_fields(engine: str, provider: dict, model: str):
         "key": "n", "type": "int", "label": "数量", "control": "chips",
         "options": [1, 2, 3, 4], "default": 1,
     }
-    refs_field = {"key": "reference_images", "type": "refs", "label": "参考图", "max": 3}
+    refs_field = {"key": "reference_images", "type": "refs", "label": "参考图", "max": ONLINE_IMAGE_REFERENCE_MAX}
 
     if engine == "runninghub":
         # RunningHub 参数按 app/工作流动态，需先选工作流再用 /api/runninghub/workflow-info 拉字段。
@@ -14297,8 +14418,6 @@ def runninghub_provider_workflow_config(workflow_id: str):
 
 def runninghub_select_workflow_config(local_cfg, provider_cfg, workflow_id: str = ""):
     static_cfg = runninghub_static_workflow_config(workflow_id)
-    if static_cfg and (isinstance(local_cfg, dict) or isinstance(provider_cfg, dict)):
-        return static_cfg
     if isinstance(local_cfg, dict) and isinstance(provider_cfg, dict):
         try:
             local_updated = int(local_cfg.get("updatedAt") or 0)
@@ -14313,6 +14432,8 @@ def runninghub_select_workflow_config(local_cfg, provider_cfg, workflow_id: str 
         return local_cfg
     if isinstance(provider_cfg, dict):
         return provider_cfg
+    if static_cfg:
+        return static_cfg
     return None
 
 def sync_runninghub_workflow_to_provider(cfg):

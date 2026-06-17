@@ -14,6 +14,8 @@ const cascadeRunBtn = document.getElementById('cascadeRunBtn');
 const fileInput = document.getElementById('fileInput');
 const apiKindToggle = document.getElementById('apiKindToggle');
 const inputThumbsRow = document.getElementById('inputThumbsRow');
+const SMART_UPLOAD_MAX = 20;
+const SMART_REFERENCE_IMAGE_MAX = 20;
 const inputPromptPreview = document.getElementById('inputPromptPreview');
 const minimap = document.getElementById('minimap');
 const minimapContent = document.getElementById('minimapContent');
@@ -76,10 +78,13 @@ let isRKeyDown = false;
 let selectionJustFinished = false;
 let resizeState = null;
 let llmInstructionResizeState = null;
+let promptSplitResizeState = null;
 let thumbDragState = null;
 let uploadTargetId = '';
 let pendingGroupUploadPoint = null;
 let mentionRange = null;
+let mentionAnchorEl = null;
+let mentionInsertMode = 'token';
 let panState = null;
 let didPan = false;
 let portDragState = null;
@@ -117,6 +122,7 @@ let promptTemplateEditing = false;
 let promptTemplateGroupEditMode = false;
 let promptPresetDeleteArmed = false;
 let createMenuPoint = {x:0, y:0};
+let createMenuGroupId = '';
 let nodeClipboard = null;
 let imageClickTimer = null;
 let suppressImageClickUntil = 0;
@@ -529,6 +535,8 @@ function mediaItemForStorage(item){
 function canvasForStorage(){
     const clean = JSON.parse(JSON.stringify(canvas || {}));
     clean.settings = settingsForStorage(canvasDefaultSmartSettings || initialSmartSettings);
+    // 日志预览的临时节点（编辑器打开期间临时塞进 nodes）绝不能被持久化，否则刷新后会留下幽灵节点。
+    if(Array.isArray(clean.nodes)) clean.nodes = clean.nodes.filter(node => node.id !== SMART_LOG_PREVIEW_NODE_ID);
     (clean.nodes || []).forEach(node => {
         if(Array.isArray(node.images)) node.images = node.images.map(mediaItemForStorage);
         if(node.runSettings) node.runSettings = settingsForStorage(node.runSettings);
@@ -802,6 +810,12 @@ function clearVolcengineSelectionOutsideVolcengine(target=settings){
 function isSmartImageNode(node){
     return Boolean(node && (node.type === 'smart-image' || !node.type));
 }
+function isSmartGroupNode(node){
+    return Boolean(node && node.type === 'smart-group');
+}
+function isSmartRunnableNode(node){
+    return Boolean(isSmartImageNode(node) || isSmartGroupNode(node));
+}
 function isHistoryGroupNode(node){
     return Boolean(isSmartImageNode(node) && (node.isHistoryGroup || node.historyFor));
 }
@@ -943,13 +957,13 @@ function activeSettingsSubject(){
     const active = activeComposerSubject?.id
         ? (nodes.find(n => n.id === activeComposerSubject.id) || activeComposerSubject)
         : selectedNode();
-    return isSmartImageNode(active) ? active : null;
+    return isSmartRunnableNode(active) ? active : null;
 }
 function activeComposerNode(){
     if(!lastComposerNodeId) return null;
     const id = String(lastComposerNodeId).split(':')[0] || '';
     const node = nodes.find(n => n.id === id);
-    return isSmartImageNode(node) ? node : null;
+    return isSmartRunnableNode(node) ? node : null;
 }
 function persistActiveSmartSettings(){
     if(!composer?.classList?.contains('open')) return;
@@ -1051,6 +1065,14 @@ const MEDIA_GROUP_THUMB_BASE = 224;
 const MEDIA_GROUP_MAX_VISIBLE_ROWS = 3;
 const EMPTY_UPLOAD_NODE_WIDTH = 316;
 const EMPTY_UPLOAD_NODE_HEIGHT = 194;
+const SMART_GROUP_DEFAULT_WIDTH = 340;
+const SMART_GROUP_DEFAULT_HEIGHT = 286;
+const SMART_GROUP_LEGACY_HEIGHT = 220;
+// 分组可缩小到的最小尺寸（缩小分组时组内图片随之等比缩小，靠这个区间产生缩放系数）。
+const SMART_GROUP_MIN_WIDTH = 150;
+const SMART_GROUP_MIN_HEIGHT = 130;
+// 组内成员的最大缩放（1=原始尺寸）：成员放大到此即封顶，分组可继续扩大但成员不再变大。
+const SMART_GROUP_MAX_MEMBER_ZOOM = 1;
 function mediaNodeDefaultScale(node){
     if((node?.images || []).length > 1 && !Number.isFinite(Number(node?.scale))) return MEDIA_GROUP_DEFAULT_SCALE;
     return Number.isFinite(Number(node?.scale)) && Number(node.scale) > 0 ? Number(node.scale) : MEDIA_NODE_DEFAULT_SCALE;
@@ -1058,6 +1080,52 @@ function mediaNodeDefaultScale(node){
 function createImageNodeAt(point, images=[], options={}){
     const layout = imageLayout(images || [], mediaNodeDefaultScale({type:'smart-image', images:images || []}), {type:'smart-image', images:images || []});
     return createNode((point?.x || 0) - Math.round(layout.width / 2), (point?.y || 0) - Math.round(layout.height / 2), images, options);
+}
+function smartGroupLayoutSize(node){
+    const explicitW = Number(node?.w);
+    const explicitH = Number(node?.h);
+    const width = Number.isFinite(explicitW) && explicitW >= SMART_GROUP_MIN_WIDTH ? explicitW : SMART_GROUP_DEFAULT_WIDTH;
+    const height = !Number.isFinite(explicitH) || explicitH === SMART_GROUP_LEGACY_HEIGHT
+        ? SMART_GROUP_DEFAULT_HEIGHT
+        : Math.max(explicitH, SMART_GROUP_MIN_HEIGHT);
+    return {
+        width:Math.round(width),
+        height:Math.round(height)
+    };
+}
+function smartGroupMembers(node){
+    if(!isSmartGroupNode(node)) return [];
+    const ids = Array.isArray(node.items) ? node.items : [];
+    const seen = new Set([node.id]);
+    return ids.map(id => nodes.find(n => n.id === id)).filter(member => {
+        if(!member || seen.has(member.id) || isSmartGroupNode(member)) return false;
+        seen.add(member.id);
+        return true;
+    });
+}
+// 分组当前缩放比例（1=原始）。分组就像“画布中的画布”：缩放分组时组内所有成员（含提示词）整体等比缩放+
+// 重排。缩放过程用每次手势开始时的快照实时计算（见 resize 处理），不存持久基准，避免移动成员后再缩放位置回退。
+// _memberZoom 仅用于：新入组的成员按它缩小，以匹配已经缩小的分组。
+function smartGroupZoom(group){
+    const z = Number(group?._memberZoom);
+    return Number.isFinite(z) && z > 0 ? z : 1;
+}
+// 让新入组的成员贴合分组当前缩放（只改尺寸、保持落点不跳动）。
+function scaleSmartGroupMemberToZoom(group, member, zoom){
+    if(!member || !(zoom > 0) || zoom === 1) return;
+    const r = nodeRect(member);
+    member.w = Math.max(40, Math.round((Number(r.width) || 0) * zoom));
+    member.h = Math.max(40, Math.round((Number(r.height) || 0) * zoom));
+    if(isSmartImageNode(member)) member.scale = 1;
+}
+function addNodeToSmartGroup(group, child){
+    if(!isSmartGroupNode(group) || !child || child.id === group.id || isSmartGroupNode(child)) return false;
+    const items = Array.isArray(group.items) ? group.items.slice() : [];
+    if(items.includes(child.id)) return false;
+    group.items = [...items, child.id];
+    // 新入组成员贴合分组当前缩放（分组已缩小时丢进来的成员也跟着变小）；只改尺寸、保持落点不跳动。
+    scaleSmartGroupMemberToZoom(group, child, smartGroupZoom(group));
+    return true;
 }
 function mediaLayoutSize(img){
     const width = Number(img?.natural_w || img?.width || img?.w || img?.layout_w || img?.preview_w || 0);
@@ -1173,15 +1241,80 @@ function smartNodeInputThumbsHtml(images, opts={}){
 const PROMPT_LLM_INSTRUCTION_DEFAULT_H = 58;
 const PROMPT_LLM_INSTRUCTION_MIN_H = 40;
 const PROMPT_LLM_INSTRUCTION_MAX_H = 400;
+const PROMPT_SPLIT_PREVIEW_DEFAULT_H = 70;
+const PROMPT_SPLIT_PREVIEW_MIN_H = 40;
+const PROMPT_SPLIT_PREVIEW_MAX_H = 220;
+const PROMPT_SPLIT_RESIZE_BAR_H = 9;
 function promptLlmInstructionHeight(node){
     const h = Number(node?.llmInstructionHeight);
     if(!Number.isFinite(h)) return PROMPT_LLM_INSTRUCTION_DEFAULT_H;
     return Math.max(PROMPT_LLM_INSTRUCTION_MIN_H, Math.min(PROMPT_LLM_INSTRUCTION_MAX_H, Math.round(h)));
 }
+function promptNodeSeparator(node){
+    const raw = String(node?.promptSeparator ?? ';');
+    return raw === '' ? ';' : raw;
+}
+function promptNodePromptItems(node){
+    const text = String(node?.text || '').trim();
+    if(!text) return [];
+    if(node?.promptSplitEnabled !== true) return [text];
+    const sep = promptNodeSeparator(node);
+    if(!sep) return [text];
+    const items = text.split(sep).map(item => item.trim()).filter(Boolean);
+    return items.length > 1 ? items : [text];
+}
+function promptNodeSplitExtraHeight(node){
+    if(node?.promptSplitEnabled !== true) return 0;
+    return 25 + promptNodeSplitPreviewHeight(node) + PROMPT_SPLIT_RESIZE_BAR_H;
+}
+function promptNodeSplitPreviewHeight(node){
+    const h = Number(node?.promptSplitPreviewHeight);
+    if(!Number.isFinite(h)) return PROMPT_SPLIT_PREVIEW_DEFAULT_H;
+    return Math.max(PROMPT_SPLIT_PREVIEW_MIN_H, Math.min(PROMPT_SPLIT_PREVIEW_MAX_H, Math.round(h)));
+}
+function syncPromptNodeHeightForSplit(node, prevExtra=0){
+    if(!node) return;
+    const nextExtra = promptNodeSplitExtraHeight(node);
+    const explicitH = Number(node.h);
+    const currentH = Number.isFinite(explicitH) ? explicitH : 0;
+    const fallbackH = promptNodeMinHeight(node);
+    node.h = Math.max(fallbackH, currentH ? currentH - Math.max(0, prevExtra) + nextExtra : fallbackH);
+    node.w = Math.max(Number(node.w) || 0, 316);
+}
+function promptNodeMinHeight(node){
+    return node?.llmEnabled ? promptNodeExpandedHeight(node) : 240 + promptNodeSplitExtraHeight(node);
+}
+function promptTextItemsForNode(node, ctx=smartLoopContext){
+    if(!node) return [];
+    if(node.type === 'smart-prompt') return promptNodePromptItems(node);
+    if(node.type === 'smart-loop'){
+        const text = smartLoopPrompt(node, ctx);
+        return text ? [text] : [];
+    }
+    if(node.type === 'smart-group') return smartGroupMembers(node).flatMap(member => promptTextItemsForNode(member, ctx));
+    return [];
+}
+function promptNodeUpstreamPromptItems(node, ctx=smartLoopContext){
+    const seen = new Set();
+    return inputNodesFor(node).flatMap(input => promptTextItemsForNode(input, ctx)).map(text => String(text || '').trim()).filter(text => {
+        if(!text || seen.has(text)) return false;
+        seen.add(text);
+        return true;
+    });
+}
+function promptNodeUpstreamPromptText(node, ctx=smartLoopContext){
+    return promptNodeUpstreamPromptItems(node, ctx).join('\n\n');
+}
+function promptNodeLLMInputText(node, ctx=smartLoopContext){
+    const upstream = promptNodeUpstreamPromptText(node, ctx).trim();
+    const instruction = String(node?.llmInstruction || '').trim() || promptNodePromptItems(node).join('\n\n').trim();
+    return [upstream, instruction].filter(Boolean).join('\n\n');
+}
 function promptNodeExpandedHeight(node){
     // 指令文本框（发送给 LLM 的内容）可拖动加高，超出默认高度的部分要叠加进节点高度。
     const extra = Math.max(0, promptLlmInstructionHeight(node) - PROMPT_LLM_INSTRUCTION_DEFAULT_H);
-    return (node?.llmSystemEnabled ? 344 : 292) + smartNodeInputThumbsHeight(promptNodeInputImages(node)) + extra;
+    const upstreamExtra = node?.llmEnabled && promptNodeUpstreamPromptItems(node).length ? 74 : 0;
+    return (node?.llmSystemEnabled ? 420 : 360) + smartNodeInputThumbsHeight(promptNodeInputImages(node)) + extra + upstreamExtra + promptNodeSplitExtraHeight(node);
 }
 function promptNodeLayoutSize(node){
     const oldCollapsedH = 230;
@@ -1189,14 +1322,15 @@ function promptNodeLayoutSize(node){
     const explicitW = Number(node?.w);
     const explicitH = Number(node?.h);
     const width = !Number.isFinite(explicitW) || explicitW === 360 ? 316 : explicitW;
-    const fallbackH = node?.llmEnabled ? promptNodeExpandedHeight(node) : 194;
+    const fallbackH = promptNodeMinHeight(node);
     const legacyExpandedH = node?.llmSystemEnabled ? 344 : 292;
-    const height = !Number.isFinite(explicitH) || explicitH === oldCollapsedH || explicitH === oldExpandedH || explicitH === legacyExpandedH
+    const height = !Number.isFinite(explicitH) || explicitH === 194 || explicitH === oldCollapsedH || explicitH === oldExpandedH || explicitH === legacyExpandedH
         ? fallbackH
         : Math.max(explicitH, fallbackH);
     return {width:Math.round(width), height:Math.round(height)};
 }
 function imageLayout(images, scale=1, node=null){
+    if(node?.type === 'smart-group') return {cols:1, rows:1, ...smartGroupLayoutSize(node), thumb:96, single:true};
     if(node?.type === 'smart-prompt') return {cols:1, rows:1, ...promptNodeLayoutSize(node), thumb:96, single:true};
     if(node?.type === 'smart-loop') return {cols:1, rows:1, width:Math.round(Number(node.w) || smartLoopWidth(node)), height:Math.round(Math.max(Number(node.h) || 0, smartLoopHeight(node))), thumb:96, single:true};
     const count = (images || []).length;
@@ -1301,7 +1435,7 @@ function renderMinimap(){
     const viewH = shell.clientHeight / viewport.scale;
     const viewX = -viewport.x / viewport.scale;
     const viewY = -viewport.y / viewport.scale;
-    const rects = nodes.map(nodeRect);
+    const rects = nodes.filter(n => n.id !== SMART_LOG_PREVIEW_NODE_ID).map(nodeRect);
     rects.push({x:viewX, y:viewY, width:viewW, height:viewH});
     const minX = Math.min(...rects.map(r => r.x), -200);
     const minY = Math.min(...rects.map(r => r.y), -200);
@@ -1841,8 +1975,27 @@ function comfyParamValue(field){
     return field.default ?? (field.type === 'boolean' ? false : (field.type === 'number' || field.type === 'slider' ? 0 : ''));
 }
 function updateProviderModels(){ renderDynamicParams(); }
+function controlTypeKey(el){
+    return el ? Array.from(el.classList).find(c => c !== 'smart-control' && c.endsWith('-control')) || '' : '';
+}
+// 记住重渲染前哪个控件的弹层是打开的：pinned=点击药丸锁定，interacting=悬浮打开后点了里面的参数。
+// 重渲染会重建 DOM、丢掉这两个状态，所以渲染后要按原样恢复，否则点一下就收起来了。
+function openControlState(){
+    const el = dynamicParams?.querySelector('.smart-control.pinned, .smart-control.interacting');
+    const key = controlTypeKey(el);
+    if(!key) return null;
+    return { key, pinned: el.classList.contains('pinned'), interacting: el.classList.contains('interacting') };
+}
+function restoreOpenControl(state){
+    if(!state) return;
+    const match = dynamicParams?.querySelector(`.smart-control.${state.key}`);
+    if(!match) return;
+    if(state.pinned) match.classList.add('pinned');
+    if(state.interacting) match.classList.add('interacting');
+}
 function renderDynamicParams(){
     if(!dynamicParams) return;
+    const keepOpen = openControlState();
     settings.engine = ['api','volcengine','modelscope','comfy','runninghub'].includes(settings.engine) ? settings.engine : 'api';
     settings.apiKind = settings.apiKind === 'video' ? 'video' : 'image';
     clearVolcengineSelectionOutsideVolcengine(settings);
@@ -1860,6 +2013,7 @@ function renderDynamicParams(){
     else if(settings.engine === 'runninghub') renderRunningHubParams();
     else renderComfyParams();
     bindDynamicParams();
+    restoreOpenControl(keepOpen);
     updatePromptPlaceholder();
     persistActiveSmartSettings();
     if(window.lucide) lucide.createIcons();
@@ -1868,18 +2022,14 @@ function renderApiParams(){
     const providers = imageProviders();
     if(!settings.provider_id || !providers.some(p => p.id === settings.provider_id)) settings.provider_id = providers[0]?.id || '';
     const models = filterJimengImageModels(providerImageModels(settings.provider_id));
-    const previousModel = settings.model;
     if(!settings.model || !models.includes(settings.model)) settings.model = models[0] || '';
-    if(previousModel !== settings.model && settings.resolution !== 'custom') settings.resolution = defaultSmartApiResolution(settings.model);
+    // 切换平台/模型时保留用户已选的分辨率（记忆），normalizeApiSizeSettings 只会修正非法的 auto。
     normalizeApiSizeSettings('');
     const outpaintLocked = settings.outpaintResolutionLocked === true;
     dynamicParams.innerHTML = `
         ${renderProviderControl(providers)}
         ${renderModelControl(models)}
-        ${renderResolutionControl('')}
-        ${outpaintLocked || settings.resolution === 'auto' ? '' : renderRatioControl('', true)}
-        ${outpaintLocked ? '' : renderInlineCustomSizeFields('')}
-        ${outpaintLocked || settings.resolution === 'auto' ? '' : renderInlineCustomRatioFields('')}
+        ${renderSizePickerControl('', true)}
         ${renderQualityControl()}
         ${renderCountVisualControl()}
     `;
@@ -1916,10 +2066,7 @@ function renderVolcengineParams(){
     dynamicParams.innerHTML = `
         ${renderProviderControl(providers)}
         ${renderModelControl(models)}
-        ${renderResolutionControl('')}
-        ${outpaintLocked ? '' : renderRatioControl('', true)}
-        ${outpaintLocked ? '' : renderInlineCustomSizeFields('')}
-        ${outpaintLocked ? '' : renderInlineCustomRatioFields('')}
+        ${renderSizePickerControl('', true)}
         ${renderQualityControl()}
         ${renderCountVisualControl()}
     `;
@@ -2021,10 +2168,7 @@ function renderMsParams(){
     dynamicParams.innerHTML = `
         ${renderMsFunctionControl()}
         ${renderMsCustomModelPill()}
-        ${renderResolutionControl('ms')}
-        ${renderRatioControl('ms', false)}
-        ${renderInlineCustomSizeFields('ms')}
-        ${renderInlineCustomRatioFields('ms')}
+        ${renderSizePickerControl('ms', false)}
         ${renderCountVisualControl()}
     `;
 }
@@ -2273,6 +2417,77 @@ function renderResolutionControl(prefix=''){
             <div class="seg-row">
                 ${options.map(value => `<button type="button" class="${value === current ? 'active' : ''}" data-smart-param="${resKey}" data-smart-value="${value}" ${value === 'auto' && !allowAuto ? 'disabled' : ''}>${value === 'auto' ? '自动' : (value === 'custom' ? escapeHtml(tr('smart.custom')) : value.toUpperCase())}</button>`).join('')}
             </div>
+        </div>
+    </div>`;
+}
+function sizePickerScope(prefix=''){
+    const resKey = prefix ? `${prefix}Resolution` : 'resolution';
+    const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
+    const value = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model) : '1k');
+    if(value === 'auto') return 'auto';
+    if(value === 'custom' || settings[ratioKey] === 'custom') return 'custom';
+    return 'preset';
+}
+function sizePickerDefaultResolution(prefix=''){
+    const value = (!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model) : '1k';
+    return value === 'auto' ? '1k' : value;
+}
+function sizePickerLabel(prefix=''){
+    const scope = sizePickerScope(prefix);
+    if(scope === 'auto') return '自动';
+    if(scope === 'custom'){
+        const resKey = prefix ? `${prefix}Resolution` : 'resolution';
+        const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
+        const resText = resolutionLabel(prefix);
+        const ratioText = ratioLabel(prefix);
+        if(settings[resKey] === 'custom' && settings[ratioKey] === 'custom') return `自定义 · ${resText} · ${ratioText}`;
+        if(settings[resKey] === 'custom') return `自定义 · ${resText}`;
+        if(settings[ratioKey] === 'custom') return `自定义 · ${ratioText} · ${resText}`;
+        return `自定义 · ${resText}`;
+    }
+    return `${ratioLabel(prefix)} · ${resolutionLabel(prefix)}`;
+}
+function renderSizePickerControl(prefix='', includeSource=false){
+    const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
+    const resKey = prefix ? `${prefix}Resolution` : 'resolution';
+    const scope = sizePickerScope(prefix);
+    const options = (!prefix && settings.engine === 'api') ? ['auto','1k','2k','4k'] : ['1k','2k','4k'];
+    const currentRes = settings[resKey] || ((!prefix && settings.engine === 'api') ? defaultSmartApiResolution(settings.model) : '1k');
+    const currentRatio = settings[ratioKey] || 'square';
+    const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && isGptImageAutoSizeModel(settings.model);
+    const ratios = [
+        ['square','1:1','正方形'], ['portrait','2:3','竖图'], ['landscape','3:2','横图'], ['portrait43','3:4','竖图'], ['landscape43','4:3','横图'],
+        ['story','9:16','竖屏'], ['wide','16:9','宽屏'], ['ultrawide','21:9','超宽'], ['ultratall','9:21','超竖'],
+        ...(includeSource ? [['source', sourceImageRatioLabel(prefix) || '原图', '适配输入']] : [])
+    ];
+    const wKey = prefix ? `${prefix}CustomWidth` : 'customWidth';
+    const hKey = prefix ? `${prefix}CustomHeight` : 'customHeight';
+    return `<div class="smart-control size-picker-control ${scope === 'auto' ? 'auto-mode' : ''} ${scope === 'custom' ? 'custom-mode' : ''}">
+        <button class="smart-pill size-picker-pill" type="button"><i data-lucide="scan-line"></i><span class="size-picker-label"><span class="size-picker-type">尺寸</span><span class="size-picker-dot"></span><span class="size-picker-value">${escapeHtml(sizePickerLabel(prefix))}</span></span></button>
+        <div class="smart-popover size-picker-popover">
+            <div class="size-picker-head">
+                <div class="smart-popover-title">尺寸选择</div>
+                <div class="size-picker-scope">
+                    <button type="button" class="${scope === 'auto' ? 'active' : ''}" data-size-scope="auto" data-size-prefix="${escapeHtml(prefix)}" ${allowAuto ? '' : 'disabled'}>自动</button>
+                    <button type="button" class="${scope === 'preset' ? 'active' : ''}" data-size-scope="preset" data-size-prefix="${escapeHtml(prefix)}">系统参数</button>
+                    <button type="button" class="${scope === 'custom' ? 'active' : ''}" data-size-scope="custom" data-size-prefix="${escapeHtml(prefix)}">自定义</button>
+                </div>
+            </div>
+            ${scope === 'auto' ? `<div class="size-picker-pane size-picker-auto"><div class="size-picker-note"><strong>自动尺寸</strong><span>使用模型默认尺寸，或由支持自动尺寸的模型自行决定。</span></div></div>` : ''}
+            ${scope === 'preset' ? `<div class="size-picker-pane size-picker-preset">
+                <div class="size-picker-list">
+                    ${ratios.map(([value, label, sub]) => `<button type="button" class="size-picker-option ${value === currentRatio ? 'active' : ''}" data-smart-param="${ratioKey}" data-smart-value="${escapeHtml(value)}"><span>${escapeHtml(label)}</span><small>${escapeHtml(sub)}</small></button>`).join('')}
+                </div>
+                <div class="size-picker-list">
+                    ${options.filter(v => v !== 'auto').map(value => `<button type="button" class="size-picker-option ${value === currentRes ? 'active' : ''}" data-smart-param="${resKey}" data-smart-value="${value}"><span>${value.toUpperCase()}</span><small>${escapeHtml(apiImageSize(currentRatio === 'source' ? 'square' : currentRatio, value, settings[prefix ? `${prefix}CustomRatio` : 'customRatio'] || '', '') || '')}</small></button>`).join('')}
+                </div>
+            </div>` : ''}
+            ${scope === 'custom' ? `<div class="size-picker-pane size-picker-custom">
+                <div class="size-custom-box">
+                    <div class="size-custom-title">自定义分辨率</div>
+                    <div class="size-custom-row"><input type="number" data-param="${wKey}" value="${escapeHtml(settings[wKey] || '')}" placeholder="宽度"><span>×</span><input type="number" data-param="${hKey}" value="${escapeHtml(settings[hKey] || '')}" placeholder="高度"></div>
+                </div>
+            </div>` : ''}
         </div>
     </div>`;
 }
@@ -2891,7 +3106,6 @@ function setDynamicSetting(key, value){
     const layoutKeys = new Set(['provider_id','model','resolution','ratio','msgenModel','msCustomModel','msResolution','msRatio','videoProvider','videoModel','videoAspect','videoResolution','comfyMode','comfyWorkflow','quality','count','enhanceUpscaleRes','editUpscaleRes','rhConfigKey','rhPayment','rhInstanceType']);
     settings[key] = numericKeys.has(key) && value !== '' ? Number(value) : value;
     if(key === 'provider_id') settings.model = '';
-    if(key === 'model' && settings.resolution !== 'custom') settings.resolution = defaultSmartApiResolution(settings.model);
     if(key === 'videoProvider') settings.videoModel = '';
     if(key === 'videoMultimodal') settings._videoMultimodalUserSet = true;
     if(key === 'videoMultimodal' && settings.videoMultimodal) settings.videoUseFrameRoles = false;
@@ -2907,10 +3121,22 @@ function setDynamicSetting(key, value){
         else if(!settings.msRatio) settings.msRatio = 'square';
     }
     if(key === 'msRatio') applySourceRatioToSettings('ms');
-    if(key === 'customRatioWidth' || key === 'customRatioHeight') settings.customRatio = settings.customRatioWidth && settings.customRatioHeight ? `${settings.customRatioWidth}:${settings.customRatioHeight}` : '';
-    if(key === 'msCustomRatioWidth' || key === 'msCustomRatioHeight') settings.msCustomRatio = settings.msCustomRatioWidth && settings.msCustomRatioHeight ? `${settings.msCustomRatioWidth}:${settings.msCustomRatioHeight}` : '';
-    if(key === 'customWidth' || key === 'customHeight') settings.customSize = settings.customWidth && settings.customHeight ? `${settings.customWidth}x${settings.customHeight}` : '';
-    if(key === 'msCustomWidth' || key === 'msCustomHeight') settings.msCustomSize = settings.msCustomWidth && settings.msCustomHeight ? `${settings.msCustomWidth}x${settings.msCustomHeight}` : '';
+    if(key === 'customRatioWidth' || key === 'customRatioHeight'){
+        settings.customRatio = settings.customRatioWidth && settings.customRatioHeight ? `${settings.customRatioWidth}:${settings.customRatioHeight}` : '';
+        settings.ratio = 'custom';
+    }
+    if(key === 'msCustomRatioWidth' || key === 'msCustomRatioHeight'){
+        settings.msCustomRatio = settings.msCustomRatioWidth && settings.msCustomRatioHeight ? `${settings.msCustomRatioWidth}:${settings.msCustomRatioHeight}` : '';
+        settings.msRatio = 'custom';
+    }
+    if(key === 'customWidth' || key === 'customHeight'){
+        settings.customSize = settings.customWidth && settings.customHeight ? `${settings.customWidth}x${settings.customHeight}` : '';
+        settings.resolution = 'custom';
+    }
+    if(key === 'msCustomWidth' || key === 'msCustomHeight'){
+        settings.msCustomSize = settings.msCustomWidth && settings.msCustomHeight ? `${settings.msCustomWidth}x${settings.msCustomHeight}` : '';
+        settings.msResolution = 'custom';
+    }
     const sizeKeys = new Set(['resolution','ratio','customRatio','customRatioWidth','customRatioHeight','customWidth','customHeight','customSize']);
     const unlockOutpaintSize = settings.outpaintResolutionLocked && sizeKeys.has(key);
     if(unlockOutpaintSize){
@@ -2932,9 +3158,18 @@ function setDynamicSetting(key, value){
     scheduleSave();
 }
 function closeAllSmartPopovers(){
-    document.querySelectorAll('.smart-control.pinned').forEach(c => c.classList.remove('pinned'));
+    document.querySelectorAll('.smart-control.pinned, .smart-control.interacting').forEach(c => c.classList.remove('pinned', 'interacting'));
+}
+// 悬浮打开弹层后点了里面的参数：标记 interacting，让它熬过重渲染不收起；鼠标真正离开该控件时才关闭。
+function markControlInteracting(el){
+    const ctrl = el?.closest?.('.smart-control');
+    if(ctrl && !ctrl.classList.contains('pinned')) ctrl.classList.add('interacting');
 }
 function bindDynamicParams(){
+    dynamicParams.querySelectorAll('.smart-control').forEach(ctrl => {
+        // 悬浮态的多选：鼠标移出整个控件（含上方弹层，弹层是 DOM 子节点）才解除，途中点参数不收起。
+        ctrl.onmouseleave = () => ctrl.classList.remove('interacting');
+    });
     dynamicParams.querySelectorAll('.smart-control > .smart-pill').forEach(pill => {
         pill.onclick = event => {
             event.preventDefault();
@@ -2949,8 +3184,35 @@ function bindDynamicParams(){
         btn.onclick = event => {
             event.preventDefault();
             event.stopPropagation();
+            markControlInteracting(btn);
             setDynamicSetting(btn.dataset.smartParam, btn.dataset.smartValue);
             if(btn.dataset.smartParam === 'videoDuration') renderDynamicParams();
+        };
+    });
+    dynamicParams.querySelectorAll('[data-size-scope]').forEach(btn => {
+        btn.onclick = event => {
+            event.preventDefault();
+            event.stopPropagation();
+            markControlInteracting(btn);
+            const prefix = btn.dataset.sizePrefix || '';
+            const scope = btn.dataset.sizeScope;
+            const resKey = prefix ? `${prefix}Resolution` : 'resolution';
+            const ratioKey = prefix ? `${prefix}Ratio` : 'ratio';
+            const allowAuto = !prefix && settings.engine === 'api' && settings.apiKind !== 'video' && isGptImageAutoSizeModel(settings.model);
+            if(scope === 'auto'){
+                if(!allowAuto) return;
+                settings[resKey] = 'auto';
+                if(!settings[ratioKey]) settings[ratioKey] = 'square';
+            } else if(scope === 'custom'){
+                settings[resKey] = 'custom';
+            } else {
+                settings[resKey] = ['1k','2k','4k'].includes(settings[resKey]) ? settings[resKey] : sizePickerDefaultResolution(prefix);
+                if(!settings[ratioKey] || settings[ratioKey] === 'custom') settings[ratioKey] = 'square';
+            }
+            persistActiveSmartSettings();
+            rememberRecentSmartSettings(settings, activeSettingsSubject());
+            renderDynamicParams();
+            scheduleSave();
         };
     });
     dynamicParams.querySelectorAll('[data-param]').forEach(input => {
@@ -3984,7 +4246,7 @@ function smartNodeInFlight(node){
 }
 function syncRunButtonState(node=selectedNode()){
     if(!runBtn) return;
-    runBtn.disabled = !isSmartImageNode(node) || smartCascadeAnyRunning() || smartNodeInFlight(node);
+    runBtn.disabled = !isSmartRunnableNode(node) || smartCascadeAnyRunning() || smartNodeInFlight(node);
 }
 function mergeSmartNode(local, remote){
     // 本地正在生成/排队的节点完全以本地为准，只把对方可能多出来的图并进来，绝不被对方旧状态冲掉
@@ -4178,7 +4440,7 @@ function assetThumbHtml(item){
     const thumb = item.thumbnail || item.thumb || item.preview || item.url || '';
     const kind = assetMediaKind(item);
     if(kind === 'video'){
-        return `<div class="asset-thumb-wrap">${smartVideoPreviewHtml(item, 512, 'class="asset-thumb" alt=""')}<span class="asset-video-badge"><i data-lucide="film"></i>VIDEO</span></div>`;
+        return `<div class="asset-thumb-wrap">${smartVideoPreviewHtml(item, 256, 'class="asset-thumb" loading="lazy" decoding="async" alt=""')}<span class="asset-video-badge"><i data-lucide="film"></i>VIDEO</span></div>`;
     }
     if(kind === 'audio'){
         return `<div class="asset-thumb-wrap media-thumb audio-thumb asset-thumb"><i data-lucide="file-audio"></i><span>${escapeHtml(item.name || 'Audio')}</span></div>`;
@@ -4186,7 +4448,8 @@ function assetThumbHtml(item){
     if(kind === 'workflow'){
         return `<div class="asset-thumb-wrap media-thumb workflow-thumb asset-thumb"><i data-lucide="workflow"></i><span>${escapeHtml(item.name || 'Workflow')}</span></div>`;
     }
-    return smartPreviewImgHtml({...item, url:thumb}, 512, 'class="asset-thumb" alt=""');
+    // 网格缩略图用较小尺寸 + 懒加载/异步解码：素材多时滚动不再一次性加载解码全部图片。
+    return smartPreviewImgHtml({...item, url:thumb}, 256, 'class="asset-thumb" loading="lazy" decoding="async" alt=""');
 }
 function renderAssetLibrary(){
     if(!assetPanel || !assetGrid || !assetCategorySelect) return;
@@ -4277,6 +4540,7 @@ function openAssetNameDialog({title='', value='', placeholder='', cancelValue=''
         };
     });
 }
+let assetHoverTimer = 0;
 function positionAssetHoverPreview(event){
     if(!assetHoverPreview || assetHoverPreview.hidden || assetHoverPreview.style.display === 'none') return;
     const pad = 14;
@@ -4313,7 +4577,10 @@ function showAssetHoverPreview(event, item){
         media.src = item.url;
         media.play?.().catch(() => {});
     } else {
-        media.src = item.url;
+        // 用预览代理（缩放图）而非原图，悬浮预览更快、不卡。
+        media.loading = 'lazy';
+        media.decoding = 'async';
+        media.src = smartMediaPreviewUrl(item, 768);
         media.alt = 'asset preview';
     }
     name.textContent = item.name || 'asset';
@@ -4414,9 +4681,16 @@ function beginAssetInlineRename(assetId){
 function bindAssetItemEvents(){
     assetGrid.querySelectorAll('.asset-item').forEach(el => {
         const thumb = el.querySelector('.asset-thumb');
-        thumb?.addEventListener('mouseenter', e => showAssetHoverPreview(e, {url:el.dataset.url, name:el.dataset.name, kind:el.dataset.kind}));
+        // 悬浮预览延迟显示：滚动时缩略图会从光标下快速划过、连发 mouseenter，立即加载大图会卡。延迟后只在
+        // 光标真正停留时才加载预览，滚动划过不触发。
+        thumb?.addEventListener('mouseenter', e => {
+            clearTimeout(assetHoverTimer);
+            const data = {url:el.dataset.url, name:el.dataset.name, kind:el.dataset.kind};
+            const cx = e.clientX, cy = e.clientY;
+            assetHoverTimer = setTimeout(() => showAssetHoverPreview({clientX:cx, clientY:cy}, data), 160);
+        });
         thumb?.addEventListener('mousemove', e => positionAssetHoverPreview(e));
-        thumb?.addEventListener('mouseleave', hideAssetHoverPreview);
+        thumb?.addEventListener('mouseleave', () => { clearTimeout(assetHoverTimer); hideAssetHoverPreview(); });
         el.addEventListener('dragstart', e => {
             hideAssetHoverPreview();
             e.dataTransfer.effectAllowed = 'copy';
@@ -4696,9 +4970,11 @@ function createPromptNode(x, y, options={}){
         x,
         y,
         w:316,
-        h:194,
+        h:240,
         title:'Prompt',
         text:'',
+        promptSeparator:';',
+        promptSplitEnabled:false,
         llmEnabled:false,
         llmProvider:providerId,
         llmModel:resolveChatModel('', providerId),
@@ -4722,6 +4998,15 @@ function createLoopNode(x, y, options={}){
     scheduleSave();
     return node;
 }
+function createSmartGroupNode(x, y, options={}){
+    if(!options.skipUndo) pushUndo();
+    const node = {id:uid('group'), type:'smart-group', x, y, w:SMART_GROUP_DEFAULT_WIDTH, h:SMART_GROUP_DEFAULT_HEIGHT, title:'智能分组', items:[], created_at:Date.now()};
+    nodes.push(node);
+    if(options.select !== false) selectedId = node.id;
+    render();
+    scheduleSave();
+    return node;
+}
 function cloneSmartNode(node, dx=0, dy=0){
     const copy = JSON.parse(JSON.stringify(node));
     copy.id = uid(
@@ -4729,12 +5014,15 @@ function cloneSmartNode(node, dx=0, dy=0){
             ? 'prompt'
             : node.type === 'smart-loop'
             ? 'loop'
+            : node.type === 'smart-group'
+            ? 'group'
             : 'smart'
     );
     copy.x = (Number(node.x) || 0) + dx;
     copy.y = (Number(node.y) || 0) + dy;
     copy.running = false;
     copy.pending = 0;
+    if(copy.type === 'smart-group') copy.title = copy.title || '智能分组';
     delete copy.runStartedAt;
     delete copy.runFinishedAt;
     delete copy.runElapsedMs;
@@ -4910,6 +5198,17 @@ function refreshConnectionLayer(){
     if(nextSvg) oldSvg.replaceWith(nextSvg);
     bindConnectionEvents();
 }
+let interactionLayerRaf = 0;
+// 拖动/缩放节点时，每个 mousemove 都全量重建连线 SVG + 小地图会掉帧；
+// 用 requestAnimationFrame 把它们合并成每帧最多刷新一次（节点本身的位移仍是即时的）。
+function scheduleInteractionLayerRefresh(){
+    if(interactionLayerRaf) return;
+    interactionLayerRaf = requestAnimationFrame(() => {
+        interactionLayerRaf = 0;
+        refreshConnectionLayer();
+        renderMinimap();
+    });
+}
 function moveNodeElementsDuringDrag(){
     if(!dragState) return;
     const groupItems = dragState.group || [{id:dragState.id}];
@@ -4925,8 +5224,7 @@ function moveNodeElementsDuringDrag(){
     if(active && (dragState.group || [{id:dragState.id}]).some(item => item.id === active.id)){
         positionComposerForNode(active);
     }
-    refreshConnectionLayer();
-    renderMinimap();
+    scheduleInteractionLayerRefresh();
 }
 function updateNodeElementDuringResize(node){
     if(!node) return;
@@ -4980,8 +5278,7 @@ function updateNodeElementDuringResize(node){
     }
     const active = selectedNode();
     if(active?.id === node.id) positionComposerForNode(active);
-    refreshConnectionLayer();
-    renderMinimap();
+    scheduleInteractionLayerRefresh();
 }
 function isVideoMediaItem(img){
     if(!img) return false;
@@ -5074,6 +5371,7 @@ function resultMediaUrls(result){
             ['url','path','src','uri','output','output_url','outputUrl','video','video_url','videoUrl','mp4_url','mp4Url','download_url','downloadUrl','preview_url','previewUrl'].forEach(key => add(value[key]));
         }
     };
+    add(result);
     ['items','outputs','videos','audios','texts','files','images','urls','data','result','output','url'].forEach(key => add(result?.[key]));
     const seen = new Set();
     return urls.map(item => {
@@ -5094,7 +5392,7 @@ function mediaKindForUrls(urls, fallback='image'){
     return fallback;
 }
 function imageRefsOnly(refs){
-    return (refs || []).filter(ref => ref?.url && mediaKindForItem(ref) === 'image');
+    return (refs || []).filter(ref => ref?.url && mediaKindForItem(ref) === 'image').slice(0, SMART_REFERENCE_IMAGE_MAX);
 }
 function looksLikeImageMediaUrl(url){
     const text = String(url || '').trim().toLowerCase();
@@ -5434,6 +5732,7 @@ function smartRunSnapshot(node, prompt, refs=[], kind='image'){
 function addSmartGenerationLog({run, outputs=[], runMs=0, error=''}) {
     if(!canvas) return;
     canvas.logs = canvas.logs || [];
+    const outputUrls = resultMediaUrls(outputs).map(item => typeof item === 'string' ? item : item?.url || '').filter(Boolean);
     const entry = {
         id:uid('log'),
         createdAt:Date.now(),
@@ -5443,7 +5742,7 @@ function addSmartGenerationLog({run, outputs=[], runMs=0, error=''}) {
         model:smartRunTaskLabel(run),
         request:smartRunRequestMeta(run),
         prompt:run?.prompt || '',
-        outputs:(outputs || []).filter(Boolean),
+        outputs:outputUrls,
         refs:run?.refs || [],
         runMs:Number(runMs || 0),
         error:error ? String(error) : ''
@@ -5451,21 +5750,54 @@ function addSmartGenerationLog({run, outputs=[], runMs=0, error=''}) {
     canvas.logs = [entry, ...canvas.logs].slice(0, 500);
     scheduleSave();
 }
+const SMART_LOG_PREVIEW_NODE_ID = '__smart_log_preview__';
+let smartLogPreviewRestore = null;
+// 移除临时预览节点并还原选中态。供 closeImageEditor 调用。
+function cleanupSmartLogPreviewNode(){
+    if(nodes.some(n => n.id === SMART_LOG_PREVIEW_NODE_ID)) nodes = nodes.filter(n => n.id !== SMART_LOG_PREVIEW_NODE_ID);
+    if(smartLogPreviewRestore){
+        selectedId = smartLogPreviewRestore.selectedId;
+        selectedImage = smartLogPreviewRestore.selectedImage;
+        smartLogPreviewRestore = null;
+    }
+}
+function closeSmartLogLightbox(){
+    const box = document.getElementById('smartLogLightbox');
+    if(!box) return;
+    box.classList.remove('open');
+    const img = box.querySelector('img');
+    if(img){ img.onerror = null; img.removeAttribute('src'); }
+}
+// 日志缩略图的轻量预览：只弹一张大图（不进编辑器那套裁剪/涂抹的重组件），点背景或关闭按钮即关。
+function openSmartLogLightbox(url, kind='image'){
+    if(!url) return;
+    if(kind === 'video' || outputUrlLooksVideo(url)){ window.open(displayMediaUrl({url}), '_blank'); return; }
+    let box = document.getElementById('smartLogLightbox');
+    if(!box){
+        box = document.createElement('div');
+        box.id = 'smartLogLightbox';
+        box.className = 'smart-log-lightbox';
+        box.innerHTML = `<img alt="preview" draggable="false"><button class="smart-log-lightbox-close" type="button" aria-label="${escapeAttr(tr('common.close') || '关闭')}"><i data-lucide="x"></i></button>`;
+        document.body.appendChild(box);
+        box.addEventListener('click', e => {
+            if(e.target === box || e.target.closest('.smart-log-lightbox-close')) closeSmartLogLightbox();
+        });
+    }
+    const img = box.querySelector('img');
+    // 原图加载失败时回退到缩略图同款的 media-preview 代理（PIL 渲染，对截断文件更宽容）。
+    let triedFallback = false;
+    img.onerror = () => {
+        if(triedFallback) return;
+        triedFallback = true;
+        const fb = smartMediaPreviewUrl({url}, 2048);
+        if(fb && fb !== img.getAttribute('src')) img.src = fb;
+    };
+    img.src = displayMediaUrl({url});
+    box.classList.add('open');
+    refreshIcons();
+}
 function smartLogPreviewNode(url, kind='image'){
-    if(kind === 'video' || outputUrlLooksVideo(url)){
-        window.open(url, '_blank');
-        return;
-    }
-    const node = {id:'__smart_log_preview__', type:'smart-image', images:[{url, name:'log-preview', kind}], title:kind === 'video' ? 'Video' : 'Image'};
-    const prevSelectedId = selectedId;
-    const prevSelectedImage = {...selectedImage};
-    nodes.push(node);
-    try { openImageEditor(node.id, 0); }
-    finally {
-        nodes = nodes.filter(n => n.id !== node.id);
-        selectedId = prevSelectedId;
-        selectedImage = prevSelectedImage;
-    }
+    openSmartLogLightbox(url, kind);
 }
 function renderSmartCanvasLog(){
     const logs = canvas?.logs || [];
@@ -5473,7 +5805,7 @@ function renderSmartCanvasLog(){
         const thumbs = (log.outputs || []).slice(0, 8).map(url => {
             const safe = escapeAttr(url);
             const kind = outputUrlLooksVideo(url) ? 'video' : 'image';
-            return kind === 'video' ? smartVideoPreviewHtml(url, 256, 'data-kind="video" alt="output"') : smartPreviewImgHtml(url, 256, 'data-kind="image" alt="output"');
+            return kind === 'video' ? smartVideoPreviewHtml(url, 256, `data-url="${safe}" data-kind="video" alt="output"`) : smartPreviewImgHtml(url, 256, `data-url="${safe}" data-kind="image" alt="output"`);
         }).join('');
         const date = new Date(log.createdAt || Date.now()).toLocaleString(window.StudioI18n?.lang() === 'en' ? 'en-US' : 'zh-CN');
         const req = log.request || {};
@@ -5494,7 +5826,7 @@ function renderSmartCanvasLog(){
                     <span class="log-chip">${escapeHtml(formatRunDuration(log.runMs || 0))}</span>
                 </div>
                 <div class="log-subline">${subParts.map(part => `<span title="${escapeAttr(part)}">${escapeHtml(part)}</span>`).join('')}</div>
-                ${log.error ? `<div class="log-error" title="${escapeAttr(log.error)}">${escapeHtml(log.error)}</div>` : ''}
+                ${log.error ? `<div class="log-error" title="${escapeAttr(log.error)}" data-error="${escapeAttr(log.error)}">${escapeHtml(log.error)}</div>` : ''}
                 <div class="log-prompt" title="${escapeAttr(log.prompt || tr('canvas.noPromptMeta'))}" data-prompt="${escapeAttr(log.prompt || '')}">${escapeHtml(log.prompt || tr('canvas.noPromptMeta'))}</div>
             </div>
             <div class="log-thumbs">${thumbs}</div>
@@ -5507,20 +5839,24 @@ function renderSmartCanvasLog(){
             smartLogPreviewNode(el.dataset.url, el.dataset.kind || 'image');
         };
     });
-    smartLogList.querySelectorAll('[data-prompt]').forEach(el => {
-        el.onclick = e => {
-            e.stopPropagation();
-            const text = el.dataset.prompt || '';
-            if(text) navigator.clipboard?.writeText(text).catch(() => {});
-            const oldText = el.textContent;
-            el.textContent = tr('canvas.copied');
-            el.classList.add('copied');
-            setTimeout(() => {
-                el.textContent = oldText;
-                el.classList.remove('copied');
-            }, 900);
-        };
-    });
+    const bindLogCopy = (selector, key) => {
+        smartLogList.querySelectorAll(selector).forEach(el => {
+            el.onclick = e => {
+                e.stopPropagation();
+                const text = el.dataset[key] || '';
+                if(text) navigator.clipboard?.writeText(text).catch(() => {});
+                const oldText = el.textContent;
+                el.textContent = tr('canvas.copied');
+                el.classList.add('copied');
+                setTimeout(() => {
+                    el.textContent = oldText;
+                    el.classList.remove('copied');
+                }, 900);
+            };
+        });
+    };
+    bindLogCopy('[data-prompt]', 'prompt');
+    bindLogCopy('[data-error]', 'error');
     refreshIcons();
 }
 function openSmartCanvasLog(){
@@ -5542,10 +5878,19 @@ function promptNodeBodyHtml(node){
     node.llmProvider = resolveChatProviderId(node.llmProvider || '');
     node.llmModel = resolveChatModel(node.llmModel || '', node.llmProvider);
     node.llmSystemEnabled = node.llmSystemEnabled === true;
+    node.promptSplitEnabled = node.promptSplitEnabled === true;
+    node.promptSeparator = promptNodeSeparator(node);
     const readonly = node.llmEnabled ? 'readonly' : '';
     const systemPrompt = (node.llmSystemPrompt || '').trim();
     const inputThumbs = smartNodeInputThumbsHtml(promptNodeInputImages(node));
     const templateActive = activePromptTemplateNodeId() === node.id;
+    const promptItems = promptNodePromptItems(node);
+    const promptSplitPreviewH = promptNodeSplitPreviewHeight(node);
+    const upstreamPromptItems = promptNodeUpstreamPromptItems(node);
+    const upstreamPromptHtml = upstreamPromptItems.length ? `<div class="prompt-node-upstream">
+        <div class="prompt-node-section-title">上游输入</div>
+        <div class="prompt-node-upstream-list">${upstreamPromptItems.map((item, index) => `<div class="prompt-node-segment"><span>${index + 1}</span><p>${escapeHtml(item)}</p></div>`).join('')}</div>
+    </div>` : '';
     const llmParams = node.llmEnabled ? `
         <div class="prompt-node-llm">
             <select class="prompt-node-control prompt-llm-provider">${chatProviderOptions(node.llmProvider)}</select>
@@ -5554,6 +5899,7 @@ function promptNodeBodyHtml(node){
                 <textarea class="prompt-node-control prompt-llm-instruction" placeholder="${escapeHtml(tr('smart.promptLlmInstructionPlaceholder'))}" style="height:${promptLlmInstructionHeight(node)}px">${escapeHtml(node.llmInstruction || '')}</textarea>
                 <div class="prompt-llm-instruction-resize prompt-node-control" data-llm-instruction-resize="1" title="拖动调整高度"><span></span></div>
             </div>
+            ${upstreamPromptHtml}
             <div class="prompt-node-llm-actions">
                 <button class="prompt-node-run prompt-node-control" type="button" ${node.running ? 'disabled' : ''}><i data-lucide="${node.running ? 'loader-2' : 'play'}"></i><span>${node.running ? escapeHtml(tr('common.running')) : escapeHtml(tr('common.run'))}</span></button>
                 <button class="prompt-node-pill prompt-node-control prompt-system-toggle ${node.llmSystemEnabled ? 'active' : ''}" type="button"><i data-lucide="${node.llmSystemEnabled ? 'toggle-right' : 'toggle-left'}"></i><span>${escapeHtml(node.llmSystemEnabled ? tr('smart.promptLlmDisableSystem') : tr('smart.promptLlmEnableSystem'))}</span></button>
@@ -5564,11 +5910,29 @@ function promptNodeBodyHtml(node){
         <textarea class="prompt-node-text prompt-node-control" ${readonly} placeholder="${escapeHtml(tr('smart.promptPlaceholderNode'))}">${escapeHtml(node.text || '')}</textarea>
         <div class="prompt-node-tools">
             <button class="prompt-node-pill prompt-node-control prompt-preset-edit ${templateActive ? 'active' : ''}" type="button"><i data-lucide="library"></i><span>模板库</span></button>
+            <button class="prompt-node-pill prompt-node-control prompt-split-toggle ${node.promptSplitEnabled ? 'active' : ''}" type="button"><i data-lucide="split"></i><span>分隔符</span></button>
             <button class="prompt-node-pill prompt-llm-toggle ${node.llmEnabled ? 'active' : ''}" type="button"><i data-lucide="sparkles"></i><span>LLM</span></button>
         </div>
+        ${node.promptSplitEnabled ? `<div class="prompt-node-split-row">
+            <label class="prompt-node-split-control prompt-node-control"><span>分隔符</span><input class="prompt-node-separator" type="text" value="${escapeHtml(node.promptSeparator)}" maxlength="8" placeholder=";"></label>
+            <span class="prompt-node-split-count">${promptItems.length || 0} 段</span>
+        </div>
+        <div class="prompt-node-segments" style="height:${promptSplitPreviewH}px">${promptItems.length ? promptItems.map((item, index) => `<div class="prompt-node-segment"><span>${index + 1}</span><p>${escapeHtml(item)}</p></div>`).join('') : ''}</div>
+        <div class="prompt-split-preview-resize prompt-node-control" data-prompt-split-resize="1" title="拖动调整高度"><span></span></div>` : ''}
         ${node.llmEnabled ? inputThumbs : ''}
         ${llmParams}
     </div>`;
+}
+function refreshPromptNodeSegmentsUi(el, node){
+    const items = promptNodePromptItems(node);
+    const count = el.querySelector('.prompt-node-split-count');
+    if(count) count.textContent = `${items.length || 0} 段`;
+    const list = el.querySelector('.prompt-node-segments');
+    if(list){
+        list.innerHTML = items.length
+            ? items.map((item, index) => `<div class="prompt-node-segment"><span>${index + 1}</span><p>${escapeHtml(item)}</p></div>`).join('')
+            : '';
+    }
 }
 function loopNumberControlHtml({label, value, key, min=1, max=100, quick=[1,2,3,4,5,6,8,10]}){
     const v = Math.max(min, Math.min(max, Number(value) || min));
@@ -5693,7 +6057,26 @@ function smartLoopBodyHtml(node){
         </div>
     </div>`;
 }
+function smartGroupBodyHtml(node){
+    const members = smartGroupMembers(node);
+    const counts = members.reduce((acc, member) => {
+        if(member.type === 'smart-prompt') acc.prompt += 1;
+        else if(member.type === 'smart-loop') acc.loop += 1;
+        else if(isSmartImageNode(member)) acc.media += Math.max(1, (member.images || []).filter(img => img?.url).length || 1);
+        return acc;
+    }, {prompt:0, media:0, loop:0});
+    const summary = [
+        counts.prompt ? `${counts.prompt} 提示词` : '',
+        counts.media ? `${counts.media} 素材` : '',
+        counts.loop ? `${counts.loop} 循环` : ''
+    ].filter(Boolean).join(' · ') || '双击添加节点';
+    return `<div class="smart-group-card">
+        <div class="smart-group-summary"><i data-lucide="group"></i><span>${escapeHtml(summary)}</span></div>
+        ${members.length ? '' : `<div class="smart-group-empty"><i data-lucide="plus"></i><span>拖入提示词 / 图片 / 循环，或双击添加</span></div>`}
+    </div>`;
+}
 function nodeBodyHtml(node, layout){
+    if(node.type === 'smart-group') return smartGroupBodyHtml(node);
     if(node.type === 'smart-prompt') return promptNodeBodyHtml(node);
     if(node.type === 'smart-loop') return smartLoopBodyHtml(node);
     const imgs = (node.images || []).map(imageForDisplay);
@@ -5897,13 +6280,20 @@ function render(){
         const node = nodes.find(n => n.id === el.dataset.id);
         if(smartNodeHasLiveMedia(node)) reusableNodes.set(node.id, el);
     });
-    const nodeHtmlEntries = nodes.map(node => {
+    const nodeHtmlEntries = nodes
+        .filter(node => node.id !== SMART_LOG_PREVIEW_NODE_ID)
+        // 分组节点先渲染（DOM 靠前→层级在下），作为成员的背板；成员渲染在后、盖在分组之上，
+        // 否则缩小分组把成员挪进卡片区域时会被分组卡片背景遮住而“消失”。
+        .slice()
+        .sort((a, b) => (isSmartGroupNode(a) ? 0 : 1) - (isSmartGroupNode(b) ? 0 : 1))
+        .map(node => {
         const imgs = node.images || [];
-        const title = node.type === 'smart-prompt' ? 'Prompt' : node.type === 'smart-loop' ? 'Loop' : (imgs.length > 1 ? 'Group' : imgs.length ? 'Image' : escapeHtml(tr('smart.createImportNode')));
+        const title = node.type === 'smart-group' ? (node.title === '万能分组' ? '智能分组' : (node.title || '智能分组')) : node.type === 'smart-prompt' ? 'Prompt' : node.type === 'smart-loop' ? 'Loop' : (imgs.length > 1 ? 'Group' : imgs.length ? 'Image' : escapeHtml(tr('smart.createImportNode')));
         const scale = nodeScale(node);
         const layout = imageLayout(imgs, scale, node);
         const isPrompt = node.type === 'smart-prompt';
         const isLoop = node.type === 'smart-loop';
+        const isSmartGroup = node.type === 'smart-group';
         const isImageNode = node.type === 'smart-image' || !node.type;
         const isJimengPending = Boolean(node.jimengPending && node.jimengPending.submitId && imgs.length === 0);
         const isQueued = Boolean(node.queued && imgs.length === 0 && !node.pending && !isJimengPending);
@@ -5913,15 +6303,15 @@ function render(){
         const isPending = ((node.pending || isQueued || isJimengPending) && imgs.length === 0);
         const body = nodeBodyHtml(node, layout);
         const deleteBtn = isGroup ? '' : `<button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button>`;
-        const hint = isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
-        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
+        const hint = isSmartGroup ? '双击添加 · 拖入归组 · 选中后生成' : isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
+        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
             <div class="node-head"><div class="node-title">${title}</div><div class="node-actions">${deleteBtn}</div></div>
             ${!isEmpty && !isGroup ? `<div class="floating-node-actions"><button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button></div>` : ''}
             ${smartNodeToolbarHtml(node)}
             ${runTimePillHtml(node)}
             <div class="node-body">${body}</div>
             <div class="node-hint">${hint}</div>
-            ${imgs.length || node.pending || isQueued || isJimengPending || isPrompt || isLoop ? '<div class="node-resize-handle" data-resize="1"></div>' : ''}
+            ${imgs.length || node.pending || isQueued || isJimengPending || isPrompt || isLoop || isSmartGroup ? '<div class="node-resize-handle" data-resize="1"></div>' : ''}
             <div class="node-port port-in" data-port="in" title="input"></div>
             <div class="node-port port-out" data-port="out" title="output"></div>
         </div>`;
@@ -6111,8 +6501,41 @@ function bindPromptNodeControls(el, node){
     const textEl = el.querySelector('.prompt-node-text');
     if(textEl) {
         bindScrollableText(textEl);
-        textEl.oninput = e => { node.text = e.target.value; scheduleSave(); };
+        textEl.oninput = e => {
+            const prevExtra = promptNodeSplitExtraHeight(node);
+            node.text = e.target.value;
+            refreshPromptNodeSegmentsUi(el, node);
+            if(node.promptSplitEnabled === true){
+                syncPromptNodeHeightForSplit(node, prevExtra);
+                updateNodeElementDuringResize(node);
+            }
+            scheduleSave();
+        };
     }
+    const separatorEl = el.querySelector('.prompt-node-separator');
+    if(separatorEl) {
+        separatorEl.oninput = e => {
+            const prevExtra = promptNodeSplitExtraHeight(node);
+            node.promptSeparator = e.target.value || ';';
+            refreshPromptNodeSegmentsUi(el, node);
+            syncPromptNodeHeightForSplit(node, prevExtra);
+            updateNodeElementDuringResize(node);
+            scheduleSave();
+        };
+    }
+    const splitToggle = el.querySelector('.prompt-split-toggle');
+    if(splitToggle) splitToggle.onclick = e => {
+        e.preventDefault();
+        e.stopPropagation();
+        const prevExtra = promptNodeSplitExtraHeight(node);
+        node.promptSplitEnabled = node.promptSplitEnabled !== true;
+        if(node.promptSplitEnabled){
+            node.promptSeparator = promptNodeSeparator(node);
+        }
+        syncPromptNodeHeightForSplit(node, prevExtra);
+        render();
+        scheduleSave();
+    };
     const presetEdit = el.querySelector('.prompt-preset-edit');
     if(presetEdit) presetEdit.onclick = e => {
         e.preventDefault();
@@ -6129,7 +6552,7 @@ function bindPromptNodeControls(el, node){
             node.h = Math.max(Number(node.h) || 0, promptNodeExpandedHeight(node));
             node.w = Math.max(Number(node.w) || 0, 316);
         } else {
-            node.h = 194;
+            node.h = promptNodeMinHeight(node);
             node.w = Math.max(Number(node.w) || 0, 316);
         }
         render();
@@ -6167,6 +6590,15 @@ function bindPromptNodeControls(el, node){
         llmInstructionResizeState = {id:node.id, startY:e.clientY, startH:promptLlmInstructionHeight(node), startNodeH:promptNodeLayoutSize(node).height};
         // 拖动期间屏蔽文本框的指针/选区，否则上拉时光标滑到上方输入框会被它抢走（选中文字/失焦）。
         document.body.classList.add('smart-node-resize', 'smart-llm-instr-resize');
+        capturePendingUndo();
+    });
+    const splitResizeEl = el.querySelector('[data-prompt-split-resize]');
+    if(splitResizeEl) splitResizeEl.addEventListener('mousedown', e => {
+        if(e.button !== 0) return;
+        e.preventDefault();
+        e.stopPropagation();
+        promptSplitResizeState = {id:node.id, startY:e.clientY, startH:promptNodeSplitPreviewHeight(node), startNodeH:promptNodeLayoutSize(node).height};
+        document.body.classList.add('smart-node-resize', 'smart-prompt-split-resize');
         capturePendingUndo();
     });
     const runEl = el.querySelector('.prompt-node-run');
@@ -6477,6 +6909,16 @@ function bindNodeEvents(){
         const nodeForControls = nodes.find(n => n.id === id);
         if(nodeForControls?.type === 'smart-prompt') bindPromptNodeControls(el, nodeForControls);
         if(nodeForControls?.type === 'smart-loop') bindLoopNodeControls(el, nodeForControls);
+        if(nodeForControls?.type === 'smart-group') {
+            el.ondblclick = e => {
+                e.preventDefault();
+                e.stopPropagation();
+                selectedId = id;
+                selectedIds = [];
+                selectedImage = {nodeId:'', index:-1};
+                openCreateMenu(e, {groupId:id});
+            };
+        }
         el.onclick = e => {
             e.stopPropagation();
             if(Date.now() < suppressNodeClickUntil) return;
@@ -6494,7 +6936,7 @@ function bindNodeEvents(){
             }
             render();
         };
-        el.ondblclick = e => e.stopPropagation();
+        if(nodeForControls?.type !== 'smart-group') el.ondblclick = e => e.stopPropagation();
         const nodeDrop = el.querySelector('.node-drop');
         nodeDrop?.addEventListener('mousedown', e => {
             if(e.button !== 0) return;
@@ -6632,10 +7074,8 @@ function bindNodeEvents(){
                 const isGroupOwner = (owner?.images || []).length > 1;
                 selectedId = id;
                 selectedIds = [];
-                // 分组内的图片单击不再"穿透"到具体图片：保持节点级 composer
-                selectedImage = isGroupOwner
-                    ? {nodeId:'', index:-1}
-                    : {nodeId:id, index:imageIndex};
+                // Composer 绑定节点本身；这里记录图层焦点，用于交叠时置顶和工具栏目标。
+                selectedImage = {nodeId:id, index:imageIndex};
                     if(smartCascadeAnyRunning()) smartCascadeSilentSelection = false;
                     syncSelectionUi();
                     updateComposer();
@@ -6680,6 +7120,23 @@ function bindNodeEvents(){
             if(!node) return;
             const rect = nodeRect(node);
             resizeState = {id, startX:e.clientX, startY:e.clientY, startW:rect.width, startH:rect.height};
+            // 分组缩放：记录本次手势开始时所有成员的位置/尺寸快照与起始缩放，缩放过程按相对快照的比例实时计算，
+            // 整体等比缩放+重排。用快照而非持久基准，移动成员后再缩放也不会回退到旧位置。
+            if(isSmartGroupNode(node)){
+                resizeState.startZoom = smartGroupZoom(node);
+                const gx0 = Number(node.x) || 0, gy0 = Number(node.y) || 0;
+                let maxR = gx0, maxB = gy0, hasM = false;
+                resizeState.members = smartGroupMembers(node).map(m => {
+                    const r = nodeRect(m);
+                    const sx = Number(m.x) || 0, sy = Number(m.y) || 0, sw = Number(r.width) || 0, sh = Number(r.height) || 0;
+                    hasM = true; maxR = Math.max(maxR, sx + sw); maxB = Math.max(maxB, sy + sh);
+                    return {id:m.id, sx, sy, sw, sh, isImage:isSmartImageNode(m)};
+                });
+                // 记录“贴合内容时的框尺寸”作为缩放映射基准（而不是当前可能含留白的框宽），
+                // 这样从放大很多的框往回缩时，框是线性跟随手柄缩小、而不是一下子跳到内容边缘。
+                resizeState.contentFitW = hasM ? Math.max(1, maxR - gx0 + 16) : (rect.width || 1);
+                resizeState.contentFitH = hasM ? Math.max(1, maxB - gy0 + 16) : (rect.height || 1);
+            }
             document.body.classList.add('smart-node-resize');
             capturePendingUndo();
         });
@@ -6692,7 +7149,11 @@ function bindNodeEvents(){
             let node = nodes.find(n => n.id === id);
             if(!node) return;
             if(e.altKey) node = duplicateForAltDrag(node);
-            const dragIds = selectedIds.includes(node.id) ? selectedIds.slice() : [node.id];
+            let dragIds = selectedIds.includes(node.id) ? selectedIds.slice() : [node.id];
+            if(isSmartGroupNode(node)){
+                const memberIds = smartGroupMembers(node).map(member => member.id);
+                dragIds = Array.from(new Set([...dragIds, ...memberIds]));
+            }
             const group = dragIds.map(dragId => {
                 const n = nodes.find(x => x.id === dragId);
                 return n ? {id:n.id, ox:Number(n.x) || 0, oy:Number(n.y) || 0} : null;
@@ -6755,9 +7216,11 @@ function dragConnectTargetFor(sourceNode, point=lastMouseWorld){
 function canAutoConnectDraggedNode(sourceNode, targetNode){
     if(!sourceNode || !targetNode || sourceNode.id === targetNode.id) return false;
     if(isHistoryGroupNode(sourceNode) || isHistoryGroupNode(targetNode)) return false;
+    if(isSmartGroupNode(targetNode)) return false;
     if(isSmartImageNode(sourceNode)) return isSmartImageNode(targetNode) || targetNode.type === 'smart-loop' || targetNode.type === 'smart-prompt';
     if(sourceNode.type === 'smart-prompt') return isSmartImageNode(targetNode) || targetNode.type === 'smart-loop';
     if(sourceNode.type === 'smart-loop') return isSmartImageNode(targetNode);
+    if(sourceNode.type === 'smart-group') return isSmartImageNode(targetNode) || targetNode.type === 'smart-loop';
     return false;
 }
 function restoreDraggedNodePosition(){
@@ -6769,6 +7232,14 @@ function restoreDraggedNodePosition(){
             n.y = item.oy;
         }
     });
+}
+function pruneSmartGroupMembershipsForNode(node){
+    if(!node || !node.id) return;
+    nodes.forEach(group => {
+        if(!isSmartGroupNode(group) || !Array.isArray(group.items)) return;
+        if(group.items.includes(node.id)) group.items = group.items.filter(id => id !== node.id);
+    });
+    // 拖出分组保持当前尺寸（不自动放大），无需额外处理。
 }
 function clearDropHighlight(){
     world.querySelectorAll('.image-node.drop-target').forEach(el => el.classList.remove('drop-target'));
@@ -6789,6 +7260,7 @@ function deleteNode(id){
     if(canvas) canvas.connections = (canvas.connections || []).filter(c => !deleteIds.has(c.from) && !deleteIds.has(c.to));
     nodes.forEach(node => {
         if(Array.isArray(node.inputNodeIds)) node.inputNodeIds = node.inputNodeIds.filter(inputId => !deleteIds.has(inputId));
+        if(isSmartGroupNode(node) && Array.isArray(node.items)) node.items = node.items.filter(itemId => !deleteIds.has(itemId));
     });
     if(selectedId === id) selectedId = '';
     selectedIds = selectedIds.filter(selected => !deleteIds.has(selected));
@@ -8879,9 +9351,18 @@ function openImageEditor(nodeId, imageIndex=0){
         refreshIcons();
         return;
     }
+    // 原图加载失败时的兜底链：依次尝试 download-output 代理、缩略图同款的 media-preview 代理（PIL 渲染，
+    // 对截断/半下载的文件比浏览器宽容，所以缩略图能显示而原图破损时它仍能出图）。兜底时去掉 crossOrigin——
+    // 预览不需要导出画布，带 crossOrigin 反而会因跨域/CORS 直接加载失败。
+    const primaryEditorSrc = displayMediaUrl(image);
+    const editorFallbackUrls = [proxiedMediaUrl(image), smartMediaPreviewUrl(image, 2048)]
+        .filter(Boolean)
+        .filter((u, i, arr) => u !== primaryEditorSrc && arr.indexOf(u) === i);
+    let editorFallbackIndex = 0;
     img.onload = () => {
         const targetImage = node.images?.[imageIndex];
-        if(targetImage && img.naturalWidth && img.naturalHeight && (!targetImage.natural_w || !targetImage.natural_h)){
+        // 兜底用的是代理/缩放图，naturalWidth 不是原图真实尺寸，别污染节点的 natural_w/h。
+        if(editorFallbackIndex === 0 && targetImage && img.naturalWidth && img.naturalHeight && (!targetImage.natural_w || !targetImage.natural_h)){
             targetImage.natural_w = img.naturalWidth;
             targetImage.natural_h = img.naturalHeight;
             scheduleSave();
@@ -8894,20 +9375,20 @@ function openImageEditor(nodeId, imageIndex=0){
         syncImageEditOverflow(); refreshIcons();
     };
     img.onerror = () => {
-        if(img.dataset.proxyFallbackTried === '1') return;
-        const fallback = proxiedMediaUrl(image);
-        if(!fallback || fallback === img.getAttribute('src')) return;
-        img.dataset.proxyFallbackTried = '1';
-        img.src = fallback;
+        if(editorFallbackIndex >= editorFallbackUrls.length) return;
+        img.src = editorFallbackUrls[editorFallbackIndex++];
     };
-    img.dataset.proxyFallbackTried = '';
-    img.crossOrigin = 'anonymous';
-    img.src = displayMediaUrl(image);
+    // 不设 crossOrigin：displayMediaUrl 已把所有地址收敛为同源（http 走本地代理），同源图片不会污染画布，
+    // 裁剪/涂抹等导出操作照常可用。而带 crossOrigin 会让浏览器对“缩略图已无 CORS 缓存的同源图”重新发起
+    // CORS 请求并失败——表现就是预览先闪一下（命中缓存）随即变成破损图。
+    img.removeAttribute('crossorigin');
+    img.src = primaryEditorSrc;
     setImageEditMode('preview');
     updatePreviewNavButtons();
     refreshIcons();
 }
 function closeImageEditor(){
+    cleanupSmartLogPreviewNode();
     imageEditModal.classList.remove('open');
     document.querySelector('.image-edit-panel')?.classList.remove('video-preview-mode');
     const img = document.getElementById('cropImage');
@@ -9235,7 +9716,7 @@ function savePromptDraftForCurrent(){
     subject.runSettings = cloneSmartSettings(settings);
 }
 function setPromptDraftForNode(node, text){
-    if(!isSmartImageNode(node)) return;
+    if(!isSmartRunnableNode(node)) return;
     const value = String(text || '');
     node.promptDraftHtml = escapeHtml(value);
     node.promptDraftText = value;
@@ -9279,7 +9760,7 @@ function updateComposer(){
         return;
     }
     composer.classList.toggle('open', !!node);
-    if(!isSmartImageNode(node)){
+    if(!isSmartRunnableNode(node)){
         if(cascadeRunBtn) cascadeRunBtn.style.display = 'none';
         savePromptDraftForCurrent();
         composer.classList.remove('open');
@@ -9313,7 +9794,8 @@ function updateComposer(){
 }
 function renderInputPromptPreview(node){
     if(!inputPromptPreview) return;
-    const text = node ? inputPromptTextFor(node).trim() : '';
+    const groupText = isSmartGroupNode(node) ? textForNode(node).trim() : '';
+    const text = node ? [groupText, inputPromptTextFor(node).trim()].filter(Boolean).join('\n\n') : '';
     inputPromptPreview.classList.toggle('has-text', Boolean(text));
     inputPromptPreview.innerHTML = text
         ? `<div class="input-prompt-preview-label">${escapeHtml(tr('smart.inputUpstream'))}</div><div class="input-prompt-preview-text">${escapeHtml(text)}</div>`
@@ -9324,8 +9806,28 @@ function renderInputThumbsRow(node){
     syncJimengModelPillForRefs();
     syncJimengVideoModelPillForRefs();
     const dedup = node ? visibleReferenceImagesFor(node) : [];
-    inputThumbsRow.classList.toggle('has-items', dedup.length > 0);
-    if(!dedup.length){ inputThumbsRow.innerHTML = ''; return; }
+    const manualRefKeys = new Set(manualReferenceImagesFor(node).map(img => inputRefKey(img)));
+    const addActive = mentionInsertMode === 'manual-ref';
+    // 仅当参考图集合/状态真正变化时才重建缩略图 DOM。否则每敲一个字都重建并重新解码所有图片，
+    // 参考图多时会让输入框打字明显卡顿。
+    const thumbsSignature = JSON.stringify({
+        node: node?.id || '',
+        items: dedup.map(img => `${inputRefKey(img)}@${img.url || ''}`),
+        manual: [...manualRefKeys],
+        add: addActive,
+        mode: node ? smartImageMode(node) : ''
+    });
+    if(inputThumbsRow.dataset.thumbsSig === thumbsSignature) return;
+    inputThumbsRow.dataset.thumbsSig = thumbsSignature;
+    inputThumbsRow.classList.toggle('has-items', Boolean(node));
+    if(!node){ inputThumbsRow.innerHTML = ''; return; }
+    const addButton = `<button class="input-thumb-add ${addActive ? 'active' : ''}" type="button" data-input-add-reference title="${escapeHtml(addActive ? '收起参考图' : '添加参考图')}" aria-label="${escapeHtml(addActive ? '收起参考图' : '添加参考图')}"><i data-lucide="image-plus"></i></button>`;
+    if(!dedup.length){
+        inputThumbsRow.innerHTML = `<div class="input-thumb-list empty"></div><div class="input-thumb-actions">${addButton}</div>`;
+        bindInputThumbReferenceActions();
+        refreshIcons();
+        return;
+    }
     const mediaCounters = {image:0, video:0, audio:0, text:0, file:0};
     const thumbsHtml = dedup.map((img, i) => {
         const isVid = isVideoMediaItem(img);
@@ -9342,30 +9844,55 @@ function renderInputThumbsRow(node){
         const count = (mediaCounters[kind] = (mediaCounters[kind] || 0) + 1);
         const label = kind === 'audio' ? `音频${count}` : kind === 'video' ? `视频${count}` : `图${count}`;
         const sourceUrl = img.originalLocalUrl || img.url || '';
-        return `<div class="input-thumb ${isSelf ? 'input-self' : ''}" draggable="false" data-thumb-index="${i}" data-node-id="${escapeHtml(img.nodeId || '')}" data-image-index="${img.imageIndex ?? ''}" data-url="${escapeHtml(img.url || '')}" data-source-url="${escapeHtml(sourceUrl)}" title="${escapeHtml(`${img.name || tr('smart.inputNum').replace('{n}', String(i + 1))} · ${title}`)}">${inner}<span class="input-thumb-label">${escapeHtml(label)}</span></div>`;
+        const key = inputRefKey(img);
+        const removable = manualRefKeys.has(key);
+        const removeBtn = removable ? `<button class="input-thumb-remove" type="button" data-input-remove-reference="${escapeHtml(inputRefKey(img))}" title="删除参考图" aria-label="删除参考图">×</button>` : '';
+        return `<div class="input-thumb ${isSelf ? 'input-self' : ''} ${removable ? 'input-manual-ref' : ''}" draggable="false" data-thumb-index="${i}" data-node-id="${escapeHtml(img.nodeId || '')}" data-image-index="${img.imageIndex ?? ''}" data-url="${escapeHtml(img.url || '')}" data-source-url="${escapeHtml(sourceUrl)}" title="${escapeHtml(`${img.name || tr('smart.inputNum').replace('{n}', String(i + 1))} · ${title}`)}">${inner}<span class="input-thumb-label">${escapeHtml(label)}</span>${removeBtn}</div>`;
     }).join('');
-    inputThumbsRow.innerHTML = `<div class="input-thumb-list">${thumbsHtml}${dedup.length > 1 ? `<span class="input-thumb-count">${escapeHtml(tr('smart.inputCount').replace('{n}', String(dedup.length)))}</span>` : ''}</div>`;
+    inputThumbsRow.innerHTML = `<div class="input-thumb-list">${thumbsHtml}${dedup.length > 1 ? `<span class="input-thumb-count">${escapeHtml(tr('smart.inputCount').replace('{n}', String(dedup.length)))}</span>` : ''}</div><div class="input-thumb-actions">${addButton}</div>`;
     bindSmartPreviewImageFallbacks(inputThumbsRow);
-    bindInputThumbsDrag(node, dedup);
+    bindInputThumbsDrag(node, dedup, manualRefKeys);
+    bindInputThumbReferenceActions();
+    refreshIcons();
 }
-function bindInputThumbsDrag(node, items){
+function bindInputThumbReferenceActions(){
+    inputThumbsRow?.querySelectorAll('[data-input-add-reference]').forEach(btn => {
+        btn.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            toggleAssetMentionPickerFromThumbs();
+        });
+    });
+    inputThumbsRow?.querySelectorAll('[data-input-remove-reference]').forEach(btn => {
+        btn.addEventListener('click', event => {
+            event.preventDefault();
+            event.stopPropagation();
+            removeManualReferenceFromSelectedNode(btn.dataset.inputRemoveReference || '');
+        });
+    });
+}
+function bindInputThumbsDrag(node, items, manualRefKeys=new Set()){
     if(!inputThumbsRow) return;
     let thumbDragIndex = -1;
     inputThumbsRow.querySelectorAll('.input-thumb').forEach(el => {
         const index = Number(el.dataset.thumbIndex || -1);
-        const canReorder = items.length > 1 && Boolean(items[index]?.nodeId);
-        el.draggable = canReorder;
+        const item = items[index];
+        const key = inputRefKey(item);
+        const canReorderManual = items.length > 1 && manualRefKeys.has(key);
+        const canReorderSource = items.length > 1 && Boolean(item?.nodeId);
+        el.draggable = canReorderManual || canReorderSource;
         el.addEventListener('click', e => {
             e.preventDefault();
             e.stopPropagation();
         });
-        if(!canReorder) return;
+        if(!el.draggable) return;
         el.addEventListener('dragstart', e => {
             e.stopPropagation();
             thumbDragIndex = index;
             el.classList.add('dragging');
             e.dataTransfer.effectAllowed = 'move';
-            e.dataTransfer.setData('application/x-smart-input-thumb', String(index));
+            if(canReorderManual) e.dataTransfer.setData('application/x-smart-manual-ref', key);
+            else e.dataTransfer.setData('application/x-smart-input-thumb', String(index));
         });
         el.addEventListener('dragend', e => {
             e.stopPropagation();
@@ -9374,6 +9901,18 @@ function bindInputThumbsDrag(node, items){
             el.classList.remove('dragging');
         });
         el.addEventListener('dragover', e => {
+            const manualFromKey = e.dataTransfer.getData('application/x-smart-manual-ref');
+            if(manualFromKey){
+                if(!manualRefKeys.has(key) || manualFromKey === key) return;
+                e.preventDefault();
+                e.stopPropagation();
+                e.dataTransfer.dropEffect = 'move';
+                clearInputThumbDropMarkers();
+                const placement = inputThumbDropPlacement(el, e);
+                el.dataset.dropPlacement = placement;
+                el.classList.add(placement === 'before' ? 'drop-before' : 'drop-after');
+                return;
+            }
             const rawFrom = e.dataTransfer.getData('application/x-smart-input-thumb');
             const from = rawFrom === '' ? thumbDragIndex : Number(rawFrom);
             if(!Number.isFinite(from) || from < 0 || from === index || !items[index]?.nodeId) return;
@@ -9391,6 +9930,16 @@ function bindInputThumbsDrag(node, items){
             el.classList.remove('drop-before', 'drop-after');
         });
         el.addEventListener('drop', e => {
+            const manualFromKey = e.dataTransfer.getData('application/x-smart-manual-ref');
+            if(manualFromKey){
+                if(!manualRefKeys.has(key) || manualFromKey === key) return;
+                e.preventDefault();
+                e.stopPropagation();
+                const placement = inputThumbDropPlacement(el, e);
+                clearInputThumbDropMarkers();
+                reorderManualInputRefs(node, manualFromKey, key, placement);
+                return;
+            }
             const rawFrom = e.dataTransfer.getData('application/x-smart-input-thumb');
             const from = rawFrom === '' ? thumbDragIndex : Number(rawFrom);
             if(!Number.isFinite(from) || from < 0 || from === index || !items[index]?.nodeId) return;
@@ -9401,6 +9950,23 @@ function bindInputThumbsDrag(node, items){
             reorderInputThumb(node, items, from, index, placement);
         });
     });
+}
+function reorderManualInputRefs(currentNode, fromKey, targetKey, placement='before'){
+    if(!currentNode || !fromKey || !targetKey || fromKey === targetKey) return false;
+    const refs = Array.isArray(currentNode.manualInputRefs) ? currentNode.manualInputRefs.slice() : [];
+    const from = refs.findIndex(item => inputRefKey(item) === fromKey);
+    const target = refs.findIndex(item => inputRefKey(item) === targetKey);
+    if(from < 0 || target < 0 || from === target) return false;
+    pushUndo();
+    const [moved] = refs.splice(from, 1);
+    let insertAt = refs.findIndex(item => inputRefKey(item) === targetKey);
+    if(insertAt < 0) return false;
+    if(placement === 'after') insertAt += 1;
+    refs.splice(insertAt, 0, moved);
+    currentNode.manualInputRefs = refs;
+    renderInputThumbsRow(currentNode);
+    scheduleSave();
+    return true;
 }
 function inputThumbDropPlacement(el, event){
     const rect = el.getBoundingClientRect();
@@ -9717,7 +10283,7 @@ function setSmartDropCopyEffect(e, includeAsset=false){
     }
 }
 async function uploadFiles(files){
-    const supported = [...(files || [])].filter(isSupportedUploadFile);
+    const supported = [...(files || [])].filter(isSupportedUploadFile).slice(0, SMART_UPLOAD_MAX);
     if(!supported.length) return [];
     const form = new FormData();
     supported.forEach(file => form.append('files', file, file.name || 'media'));
@@ -9732,12 +10298,14 @@ async function uploadFiles(files){
 }
 function appendImagesToSmartNode(uploaded, targetId='', opts={}){
     const images = [...(uploaded || [])].filter(file => file?.url);
-    if(!images.length) return;
-    let node = nodes.find(n => n.id === targetId) || selectedNode();
+    if(!images.length) return null;
+    const targetGroup = nodes.find(n => n.id === targetId && isSmartGroupNode(n));
+    let node = targetGroup ? null : (nodes.find(n => n.id === targetId) || selectedNode());
     if(node && !isSmartImageNode(node)) node = null;
     if(opts.forceNew) node = null;
     if(!node){
-        const center = opts.point || viewportCenter();
+        const groupRect = targetGroup ? nodeRect(targetGroup) : null;
+        const center = opts.point || (groupRect ? {x:groupRect.x + groupRect.width / 2, y:groupRect.y + groupRect.height / 2} : viewportCenter());
         undoSuppressed = true;
         node = createImageNodeAt(center, []);
         undoSuppressed = false;
@@ -9753,13 +10321,15 @@ function appendImagesToSmartNode(uploaded, targetId='', opts={}){
         delete node.h;
     }
     if(node.images.length === 1){ node.title = uploadTitleForItems(node.images, node.title || 'Image'); delete node.w; delete node.h; }
+    if(targetGroup) addNodeToSmartGroup(targetGroup, node);
     selectedId = node.id;
     render();
     scheduleSave();
+    return node;
 }
 async function handleFiles(files, targetId='', opts={}){
     try {
-        const fileList = [...(files || [])].filter(isSupportedUploadFile);
+        const fileList = [...(files || [])].filter(isSupportedUploadFile).slice(0, SMART_UPLOAD_MAX);
         if(!fileList.length) return;
         const uploaded = await uploadFiles(fileList);
         if(!uploaded.length) return;
@@ -9772,7 +10342,7 @@ async function importSmartLocalImages(paths){
     const response = await fetch('/api/ai/import-local-image', {
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({paths})
+        body:JSON.stringify({paths:(paths || []).slice(0, SMART_UPLOAD_MAX)})
     });
     if(!response.ok) throw new Error(await smartResponseErrorMessage(response, tr('smart.toastUploadFail')));
     const data = await response.json();
@@ -10008,8 +10578,8 @@ function connectInputNode(fromId, toId){
     const to = nodes.find(n => n.id === toId);
     if(!from || !to || from.id === to.id) return false;
     if(to.type === 'smart-loop'){
-        const looksImage = isSmartImageNode(from) || (from.type === 'smart-loop' && from.imageInput);
-        const looksPrompt = from.type === 'smart-prompt' || (from.type === 'smart-loop' && from.showPrompt);
+        const looksImage = isSmartImageNode(from) || isSmartGroupNode(from) || (from.type === 'smart-loop' && from.imageInput);
+        const looksPrompt = from.type === 'smart-prompt' || isSmartGroupNode(from) || (from.type === 'smart-loop' && from.showPrompt);
         if(looksImage && !to.imageInput) to.imageInput = true;
         if(looksPrompt && !to.showPrompt) to.showPrompt = true;
         if(looksImage || looksPrompt) fitSmartLoopNode(to);
@@ -10064,6 +10634,9 @@ function cleanupDetachedRunInputRefs(){
     return changed;
 }
 function imagesForNode(node){
+    if(isSmartGroupNode(node)){
+        return smartGroupMembers(node).flatMap(member => imagesForNode(member));
+    }
     return (node?.images || []).map((img, index) => ({...imageForDisplay(img), nodeId:node.id, imageIndex:index}));
 }
 function nodeHasReferenceContent(node){
@@ -10127,7 +10700,7 @@ function smartLoopInputPromptItems(node){
     smartLoopPromptVisiting.add(node.id);
     try {
         return inputNodesFor(node).flatMap(input => {
-            if(input.type === 'smart-prompt') return String(input.text || '').trim() ? [String(input.text || '').trim()] : [];
+            if(input.type === 'smart-prompt') return promptNodePromptItems(input);
             if(input.type === 'smart-loop') {
                 const text = smartLoopPrompt(input);
                 return text ? [text] : [];
@@ -10185,6 +10758,7 @@ function smartLoopPreviewImages(node){
     }).filter(img => img?.url);
 }
 function outputImagesForNode(node, consume=false, ctx=smartLoopContext){
+    if(node?.type === 'smart-group') return imagesForNode(node).filter(img => img?.url);
     if(node?.type === 'smart-loop') return smartLoopInputImages(node, ctx);
     const roundOutputs = ctx?.roundOutputs;
     if(node?.id && roundOutputs && typeof roundOutputs.get === 'function' && roundOutputs.has(node.id)){
@@ -10197,12 +10771,13 @@ function selfReferenceImagesForNode(node, consume=false, ctx=smartLoopContext){
 }
 function textForNode(node, ctx=smartLoopContext){
     if(!node) return '';
-    if(node.type === 'smart-prompt') return node.text || '';
+    if(node.type === 'smart-prompt') return promptNodePromptItems(node).join('\n\n');
     if(node.type === 'smart-loop') return smartLoopPrompt(node, ctx);
+    if(node.type === 'smart-group') return smartGroupMembers(node).map(member => textForNode(member, ctx)).filter(Boolean).join('\n\n');
     return '';
 }
 function promptInputNodesFor(node){
-    return inputNodesFor(node).filter(input => input?.type === 'smart-prompt' || input?.type === 'smart-loop');
+    return inputNodesFor(node).filter(input => input?.type === 'smart-prompt' || input?.type === 'smart-loop' || input?.type === 'smart-group');
 }
 function inputPromptTextFor(node, ctx=smartLoopContext){
     const directText = promptInputNodesFor(node).map(input => textForNode(input, ctx)).filter(Boolean);
@@ -10242,6 +10817,16 @@ function inputRefKey(img){
 function blockedInputRefKeys(node){
     return new Set(Array.isArray(node?.blockedInputRefs) ? node.blockedInputRefs.filter(Boolean) : []);
 }
+function manualReferenceImagesFor(node){
+    if(!node || !Array.isArray(node.manualInputRefs)) return [];
+    return node.manualInputRefs.filter(img => img?.url).map((img, index) => ({
+        ...img,
+        kind:img.kind || mediaKindForItem(img),
+        name:img.name || `图${index + 1}`,
+        imageIndex:Number.isFinite(Number(img.imageIndex)) ? Number(img.imageIndex) : index,
+        manualAdded:true
+    }));
+}
 function isInputRefBlocked(node, img){
     if(!node || !img?.url) return false;
     return blockedInputRefKeys(node).has(inputRefKey(img));
@@ -10266,9 +10851,10 @@ function defaultReferenceImagesFor(node, consume=false, ctx=smartLoopContext){
     if(!node) return [];
     const self = selfReferenceImagesForNode(node, consume, ctx).filter(img => img?.url);
     const upstream = defaultInputImagesFor(node, consume, ctx);
-    if(smartImageUsesWorkflowInput(node, ctx)) return uniqueReferenceImages(upstream);
-    if(self.length) return uniqueReferenceImages(self);
-    return uniqueReferenceImages(upstream);
+    const manual = manualReferenceImagesFor(node);
+    if(smartImageUsesWorkflowInput(node, ctx)) return uniqueReferenceImages([...upstream, ...manual]);
+    if(self.length) return uniqueReferenceImages([...self, ...manual]);
+    return uniqueReferenceImages([...upstream, ...manual]);
 }
 function lineConnectionsFor(node){
     if(!node) return [];
@@ -10340,6 +10926,7 @@ function uniqueReferenceImages(images){
     (images || []).forEach((img, index) => {
         if(!img?.url || seen.has(img.url)) return;
         seen.add(img.url);
+        if(refs.length >= SMART_REFERENCE_IMAGE_MAX) return;
         refs.push({
             ...img,
             name:img.name || `图${refs.length + 1}`,
@@ -10354,7 +10941,7 @@ function visibleReferenceImagesFor(node){
     return uniqueReferenceImages([...base, ...collectMentionedImagesFromPrompt()]);
 }
 function inputMentionCandidateImages(node){
-    const current = node ? lineImagesFor(node) : [];
+    const current = node ? [...lineImagesFor(node), ...manualReferenceImagesFor(node)] : [];
     const seen = new Set();
     return current.filter(img => {
         if(!img?.url || seen.has(img.url)) return false;
@@ -10407,6 +10994,9 @@ function referenceImagesFor(node){
 function closeMentionPicker(){
     mentionPicker.classList.remove('open');
     mentionPicker.innerHTML = '';
+    mentionAnchorEl = null;
+    mentionInsertMode = 'token';
+    if(selectedNode()) renderInputThumbsRow(selectedNode());
 }
 function saveMentionRange(){
     const sel = window.getSelection();
@@ -10480,6 +11070,13 @@ function renderMentionPicker(source){
     `;
     mentionPicker._items = candidates;
     bindSmartPreviewImageFallbacks(mentionPicker);
+    if(mentionInsertMode === 'manual-ref'){
+        placeMentionPickerInComposerCard();
+        renderInputThumbsRow(selectedNode());
+        mentionAnchorEl = inputThumbsRow?.querySelector('[data-input-add-reference]') || inputThumbsRow;
+    } else {
+        placeMentionPickerInPromptRow();
+    }
     positionMentionPickerAtCaret();
     mentionPicker.classList.add('open');
     mentionPicker.querySelectorAll('[data-mention-source]').forEach(btn => {
@@ -10509,7 +11106,9 @@ function renderMentionPicker(source){
     mentionPicker.querySelectorAll('[data-mention-index]').forEach(btn => {
         btn.addEventListener('mousedown', e => {
             e.preventDefault(); e.stopPropagation();
-            insertMentionToken(mentionPicker._items[Number(btn.dataset.mentionIndex)]);
+            const item = mentionPicker._items[Number(btn.dataset.mentionIndex)];
+            if(mentionInsertMode === 'manual-ref') addManualReferenceToSelectedNode(item);
+            else insertMentionToken(item);
         });
     });
     refreshIcons();
@@ -10517,12 +11116,101 @@ function renderMentionPicker(source){
 function showMentionPicker(){
     const node = selectedNode();
     const hasInput = inputMentionCandidateImages(node).length > 0;
+    mentionInsertMode = 'token';
+    mentionAnchorEl = null;
+    placeMentionPickerInPromptRow();
     mentionSource = hasInput ? 'input' : 'asset';
     renderMentionPicker(mentionSource);
+}
+function setPromptCaretToEnd(){
+    if(!promptInput) return;
+    promptInput.focus();
+    const range = document.createRange();
+    range.selectNodeContents(promptInput);
+    range.collapse(false);
+    const sel = window.getSelection();
+    sel.removeAllRanges();
+    sel.addRange(range);
+    mentionRange = range.cloneRange();
+}
+function toggleAssetMentionPickerFromThumbs(){
+    if(!selectedNode()) return;
+    if(mentionInsertMode === 'manual-ref'){
+        closeMentionPicker();
+        return;
+    }
+    mentionInsertMode = 'manual-ref';
+    renderInputThumbsRow(selectedNode());
+    mentionAnchorEl = inputThumbsRow?.querySelector('[data-input-add-reference]') || inputThumbsRow;
+    renderMentionPicker('asset');
+}
+function addManualReferenceToSelectedNode(img){
+    const node = selectedNode();
+    if(!node || !img?.url) return;
+    const kind = img.kind || mediaKindForItem(img);
+    const ref = {
+        url:img.url,
+        name:img.alias || img.name || (kind === 'audio' ? '音频' : kind === 'video' ? '视频' : '图片'),
+        kind,
+        nodeId:img.nodeId || '',
+        imageIndex:Number.isFinite(Number(img.imageIndex)) ? Number(img.imageIndex) : '',
+        asset_uris:img.asset_uris || {},
+        manualAdded:true
+    };
+    if(img.originalLocalUrl) ref.originalLocalUrl = img.originalLocalUrl;
+    const refs = Array.isArray(node.manualInputRefs) ? node.manualInputRefs.slice() : [];
+    const key = inputRefKey(ref);
+    const exists = refs.some(item => inputRefKey(item) === key || item.url === ref.url);
+    if(exists){
+        closeMentionPicker();
+        return;
+    }
+    pushUndo();
+    refs.push(ref);
+    node.manualInputRefs = refs;
+    closeMentionPicker();
+    renderInputThumbsRow(node);
+    scheduleSave();
+}
+function removeManualReferenceFromSelectedNode(key){
+    const node = selectedNode();
+    if(!node || !key || !Array.isArray(node.manualInputRefs)) return;
+    const refs = node.manualInputRefs.slice();
+    const index = refs.findIndex(ref => inputRefKey(ref) === key || ref?.url === key.replace(/^url\|/, ''));
+    if(index < 0) return;
+    pushUndo();
+    refs.splice(index, 1);
+    node.manualInputRefs = refs;
+    if(!refs.length) delete node.manualInputRefs;
+    renderInputThumbsRow(node);
+    scheduleSave();
+}
+function placeMentionPickerInPromptRow(){
+    const row = promptInput?.closest?.('.prompt-row');
+    if(row && mentionPicker.parentElement !== row) row.insertBefore(mentionPicker, promptResize || null);
+}
+function placeMentionPickerInComposerCard(){
+    const card = promptInput?.closest?.('.composer-card');
+    if(card && mentionPicker.parentElement !== card) card.appendChild(mentionPicker);
 }
 function positionMentionPickerAtCaret(){
     const row = promptInput.closest('.prompt-row');
     const rowRect = row.getBoundingClientRect();
+    if(mentionAnchorEl){
+        const anchorRect = mentionAnchorEl.getBoundingClientRect();
+        const scale = (typeof viewport !== 'undefined' && Number(viewport?.scale)) || 1;
+        const safeScale = scale > 0 ? scale : 1;
+        const pickerWidth = mentionPicker.offsetWidth || 340;
+        const base = mentionPicker.offsetParent || mentionPicker.parentElement || row;
+        const baseRect = base.getBoundingClientRect();
+        const baseLogicalWidth = baseRect.width / safeScale;
+        const rawLeft = (anchorRect.right - baseRect.left) / safeScale - pickerWidth;
+        const rawTop = (anchorRect.bottom - baseRect.top) / safeScale + 2;
+        const left = Math.max(4, Math.min(rawLeft, Math.max(4, baseLogicalWidth - pickerWidth - 4)));
+        mentionPicker.style.left = `${left}px`;
+        mentionPicker.style.top = `${Math.max(2, rawTop)}px`;
+        return;
+    }
     let caretRect = null;
     const sel = window.getSelection();
     if(sel && sel.rangeCount){
@@ -10665,14 +11353,19 @@ function buildPromptRequest(node, overrideDefaultImages=null, consumeDefault=fal
             return;
         }
         if(!refMap.has(part.url)){
+            if(refs.length >= SMART_REFERENCE_IMAGE_MAX){
+                body += `@${part.name || '图片'}`;
+                return;
+            }
             refMap.set(part.url, refs.length + 1);
             refs.push({url:part.url, name:part.name || `图${refs.length + 1}`, nodeId:part.nodeId, imageIndex:part.imageIndex, kind:part.kind || 'image', asset_uris:part.asset_uris || {}, role:`image_${refs.length + 1}`});
         }
         body += `图${refMap.get(part.url)}`;
     });
     body = body.replace(/[ \t]+\n/g, '\n').replace(/\n{3,}/g, '\n\n').trim();
+    const groupPrompt = isSmartGroupNode(node) ? textForNode(node, ctx).trim() : '';
     const inputPrompt = inputPromptTextFor(node, ctx).trim();
-    if(inputPrompt) body = [inputPrompt, body].filter(Boolean).join('\n\n');
+    if(groupPrompt || inputPrompt) body = [groupPrompt, inputPrompt, body].filter(Boolean).join('\n\n');
     if(!body && settings.engine === 'runninghub'){
         body = rhDefaultPromptSuggestion();
     }
@@ -10772,6 +11465,7 @@ function createParallelLoopOutputNode(templateNode, sourceNode, roundIndex, roun
     // 连线到这些上游；若不清空，节点即便没有任何连线也会一直显示"上游输入xxxx"。
     output.inputNodeIds = [];
     delete output.blockedInputRefs;
+    delete output.manualInputRefs;
     nodes.push(output);
     connectInputNode(sourceNode.id, output.id);
     return output;
@@ -10838,6 +11532,7 @@ function createLoopOutputSlot(rootNode, roundIndex, roundOffset=0, options={}){
     // 连接到 root，却会因继承 root 的 inputNodeIds 而误显示上游提示词输入。
     output.inputNodeIds = [];
     delete output.blockedInputRefs;
+    delete output.manualInputRefs;
     tagLoopOutputSlot(output, rootNode, options.loopNode || null, roundIndex, options.slotIndex ?? roundOffset);
     const slots = loopOutputSlotsForRoot(rootNode).map(nodeRect);
     let y = (Number(rootNode.y) || 0) + roundOffset * ((Number(rootRect.height) || 180) + 28);
@@ -12109,9 +12804,9 @@ async function runGeneration(){
         ? (settings.comfyMode === 'text' || settings.comfyMode === 'enhance' || settings.comfyMode === 'edit' || settings.comfyMode === 'custom' ? 1 : 1)
         : Math.max(1, Math.min(8, Number(settings.count || 1)));
     const apiConcurrentRun = isApiLikeEngine(settings.engine) || settings.engine === 'runninghub' || settings.engine === 'modelscope' || settings.engine === 'comfy';
-    const nodeHasImages = (node.images || []).some(img => img?.url);
+    const nodeHasImages = isSmartGroupNode(node) ? imagesForNode(node).some(img => img?.url) : (node.images || []).some(img => img?.url);
     const workflowModeRun = smartImageUsesWorkflowInput(node, smartLoopContext);
-    const sourceVisualState = nodeHasImages && !workflowModeRun ? {
+    const sourceVisualState = isSmartImageNode(node) && nodeHasImages && !workflowModeRun ? {
         images:(node.images || []).map(img => ({...img})),
         title:node.title,
         w:node.w,
@@ -12122,9 +12817,11 @@ async function runGeneration(){
     pushUndo();
     let extracted = null;
     let branchNode = null;
-    const pendingMeta = nodeHasImages && !workflowModeRun ? stripRunInputMeta(meta) : meta;
+    const groupRun = isSmartGroupNode(node);
+    const shouldCreateBranchOutput = groupRun || (nodeHasImages && !workflowModeRun);
+    const pendingMeta = shouldCreateBranchOutput ? stripRunInputMeta(meta) : meta;
     undoSuppressed = true;
-    if(nodeHasImages && !workflowModeRun) branchNode = createPendingOutputFromSource(node, expectedCount, pendingMeta, {connectSource:false, selectOutput:true, refs});
+    if(shouldCreateBranchOutput) branchNode = createPendingOutputFromSource(node, expectedCount, pendingMeta, {connectSource:false, selectOutput:true, refs});
     undoSuppressed = false;
     const pendingNode = branchNode || node;
     if(extracted) pendingNode._runMetaTargetId = extracted.id;
@@ -12243,7 +12940,7 @@ async function runGeneration(){
 async function runPromptLLMNode(nodeId){
     const node = nodes.find(n => n.id === nodeId);
     if(!node || node.type !== 'smart-prompt') return;
-    const message = (node.llmInstruction || node.text || '').trim();
+    const message = promptNodeLLMInputText(node).trim();
     if(!message){ toast(tr('smart.promptLlmNeedText')); return; }
     const systemPrompt = (node.llmSystemPrompt || '').trim();
     node.llmEnabled = true;
@@ -12292,7 +12989,7 @@ function comfyFieldKind(field){
 async function runApiGeneration(prompt, refs, runSettings=settings){
     if(!runSettings.provider_id || !runSettings.model) throw new Error(tr('smart.errNoApiModel'));
     const count = Math.max(1, Math.min(8, Number(runSettings.count || 1)));
-    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), quality:runSettings.quality || 'auto', n:1, reference_images:imageRefsOnly(refs)};
+    const payload = {prompt, provider_id:runSettings.provider_id, model:runSettings.model, size:sizeForRun(runSettings), quality:runSettings.quality || 'auto', n:1, reference_images:imageRefsOnly(refs).slice(0, SMART_REFERENCE_IMAGE_MAX)};
     const tasks = await Promise.all(Array.from({length:count}, () => fetch('/api/canvas-image-tasks', {method:'POST', headers:{'Content-Type':'application/json'}, body:JSON.stringify(payload)}).then(async r => {
         if(!r.ok) throw new Error(await r.text());
         return r.json();
@@ -12411,7 +13108,7 @@ async function runModelscopeGeneration(prompt, refs, runSettings=settings){
     const height = Number(parsed?.height) || 1024;
     const imageUrls = [];
     if(msModel.supportsImage || msModel.acceptsImage){
-        for(const ref of refs.slice(0, 3)){
+        for(const ref of refs.slice(0, SMART_REFERENCE_IMAGE_MAX)){
             if(ref.url) imageUrls.push(await urlToBase64(ref.url).catch(() => ref.url));
         }
     }
@@ -12726,7 +13423,7 @@ async function querySmartImageTaskNow(nodeId, localTaskId){
         if(data.status === 'succeeded'){
             task.failed = false;
             task.querying = false;
-            finalizeSmartPendingTask(node, task.taskId, data.images || [], task.kind || 'image');
+            finalizeSmartPendingTask(node, task.taskId, resultMediaUrls(data.images?.length ? data.images : data), task.kind || 'image');
             render();
             scheduleSave();
             return;
@@ -12813,7 +13510,8 @@ function finalizeSmartPendingTask(node, taskId, images, kind='image'){
     node.pendingTasks = smartPendingTasks(node).filter(task => task.taskId !== taskId);
     node.pending = Math.max(0, Number(node.pending || 0) - 1);
     const ext = kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : kind === 'text' ? 'txt' : 'png';
-    const additions = (images || []).map((item, i) => {
+    const mediaItems = resultMediaUrls(images);
+    const additions = (mediaItems || []).map((item, i) => {
         const url = typeof item === 'string' ? item : item?.url || '';
         const itemKind = (typeof item === 'object' && item.kind) || kind;
         return stripImageGenerationMeta(copyMediaSizeFields(item, {url, name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`, kind:itemKind, generatedResult:true}));
@@ -12828,7 +13526,8 @@ function finalizeSmartPendingTask(node, taskId, images, kind='image'){
         node.runTimerHidden = false;
         node.running = false;
         node.title = node.images.length > 1 ? (kind === 'video' ? 'Videos' : kind === 'audio' ? 'Audios' : kind === 'text' ? 'Texts' : 'Group') : (kind === 'video' ? 'Video' : kind === 'audio' ? 'Audio' : kind === 'text' ? 'Text' : 'Image');
-        node.scale = mediaNodeDefaultScale(node);
+        if(node.images.length > 1 && (!Number.isFinite(Number(node.scale)) || Number(node.scale) === MEDIA_NODE_DEFAULT_SCALE || Number(node.scale) === MEDIA_GROUP_PREVIOUS_DEFAULT_SCALE)) node.scale = MEDIA_GROUP_DEFAULT_SCALE;
+        else node.scale = mediaNodeDefaultScale(node);
         delete node.w;
         delete node.h;
     }
@@ -12844,7 +13543,7 @@ async function resumeSmartPendingNode(node){
         if(task.failed && task.recoverTaskId) return;
         try {
             const result = await pollSmartCanvasTask(task.taskId);
-            finalizeSmartPendingTask(node, task.taskId, result?.images || [], task.kind || 'image');
+            finalizeSmartPendingTask(node, task.taskId, resultMediaUrls(result?.images?.length ? result.images : result), task.kind || 'image');
             render();
             scheduleSave();
         } catch(e) {
@@ -12923,21 +13622,26 @@ function finishSelection(event){
 }
 function groupSelectedNodes(){
     const ids = selectedIds.length ? selectedIds.slice() : (selectedId ? [selectedId] : []);
-    const selected = ids.map(id => nodes.find(n => n.id === id)).filter(n => n && (n.images || []).length);
-    if(selected.length < 2){ toast(tr('smart.toastNeedGroup')); return; }
+    const selected = ids.map(id => nodes.find(n => n.id === id)).filter(n => n && !isSmartGroupNode(n));
+    if(selected.length < 1){ toast('请选择要放入分组的节点'); return; }
     pushUndo();
     const rects = selected.map(nodeRect);
-    const x = Math.min(...rects.map(r => r.x));
-    const y = Math.min(...rects.map(r => r.y));
-    const images = selected.flatMap(node => (node.images || []).map(img => applyNodeMetaToImage({...img}, node)));
-    const group = {id:uid('smart'), type:'smart-image', x, y, title:'Group', images, scale:MEDIA_GROUP_DEFAULT_SCALE, created_at:Date.now()};
-    nodes = nodes.filter(n => !ids.includes(n.id));
+    const minX = Math.min(...rects.map(r => r.x));
+    const minY = Math.min(...rects.map(r => r.y));
+    const maxX = Math.max(...rects.map(r => r.x + r.width));
+    const maxY = Math.max(...rects.map(r => r.y + r.height));
+    const group = {
+        id:uid('group'),
+        type:'smart-group',
+        x:Math.round(minX - 18),
+        y:Math.round(minY - 44),
+        w:Math.max(340, Math.round(maxX - minX + 36)),
+        h:Math.max(220, Math.round(maxY - minY + 72)),
+        title:'智能分组',
+        items:selected.map(node => node.id),
+        created_at:Date.now()
+    };
     nodes.push(group);
-    canvas.connections = (canvas.connections || []).map(conn => ({
-        ...conn,
-        from:ids.includes(conn.from) ? group.id : conn.from,
-        to:ids.includes(conn.to) ? group.id : conn.to
-    })).filter((conn, index, arr) => conn.from !== conn.to && arr.findIndex(c => c.from === conn.from && c.to === conn.to && (c.kind || 'flow') === (conn.kind || 'flow')) === index);
     selectedIds = [];
     selectedId = group.id;
     selectedImage = {nodeId:'', index:-1};
@@ -13016,14 +13720,39 @@ function mergeImageNodesIntoGroup(sourceId, targetId){
     selectedImage = {nodeId:'', index:-1};
     return true;
 }
+function smartGroupTargetForDraggedNode(draggedNode){
+    if(!draggedNode || isSmartGroupNode(draggedNode)) return null;
+    const r = nodeRect(draggedNode);
+    const excluded = new Set([draggedNode.id, ...(dragState?.groupIds || [])]);
+    const cx = r.x + r.width / 2;
+    const cy = r.y + r.height / 2;
+    const groups = nodes
+        .filter(node => isSmartGroupNode(node) && !excluded.has(node.id))
+        .map(group => ({group, rect:nodeRect(group)}))
+        .filter(item => cx >= item.rect.x && cx <= item.rect.x + item.rect.width && cy >= item.rect.y && cy <= item.rect.y + item.rect.height);
+    if(!groups.length) return null;
+    groups.sort((a, b) => (nodes.indexOf(b.group) - nodes.indexOf(a.group)));
+    return groups[0].group;
+}
+function addDraggedNodeToSmartGroup(draggedNode, group){
+    if(!draggedNode || !group) return false;
+    const added = addNodeToSmartGroup(group, draggedNode);
+    if(!added) return false;
+    selectedIds = [];
+    selectedId = draggedNode.id;
+    selectedImage = {nodeId:'', index:-1};
+    return true;
+}
 function closeCreateMenu(){
     createMenu?.classList.remove('open');
+    createMenuGroupId = '';
 }
-function openCreateMenu(event){
+function openCreateMenu(event, options={}){
     if(!createMenu) return;
     createMenuPoint = screenToWorld(event);
-    const w = 420;
-    const h = 286;
+    createMenuGroupId = options.groupId || '';
+    const w = 500;
+    const h = 114;
     const left = Math.max(14, Math.min(window.innerWidth - w - 14, event.clientX + 8));
     const top = Math.max(14, Math.min(window.innerHeight - h - 14, event.clientY + 8));
     createMenu.style.left = `${left}px`;
@@ -13031,12 +13760,26 @@ function openCreateMenu(event){
     createMenu.classList.add('open');
     refreshIcons();
 }
+function addCreatedNodeToMenuGroup(node){
+    const group = createMenuGroupId ? nodes.find(n => n.id === createMenuGroupId) : null;
+    if(addNodeToSmartGroup(group, node)){
+        render();
+        scheduleSave();
+    }
+}
 function createNodeFromMenu(type){
     const p = createMenuPoint || viewportCenter();
+    const groupId = createMenuGroupId;
     closeCreateMenu();
-    if(type === 'prompt') return createPromptNode(p.x - 158, p.y - 97);
-    if(type === 'loop') return createLoopNode(p.x - 135, p.y - 95);
-    return createImageNodeAt(p);
+    if(type === 'group') return createSmartGroupNode(p.x - 170, p.y - 110);
+    let created = null;
+    if(type === 'prompt') created = createPromptNode(p.x - 158, p.y - 97);
+    else if(type === 'loop') created = createLoopNode(p.x - 135, p.y - 95);
+    else created = createImageNodeAt(p);
+    createMenuGroupId = groupId;
+    addCreatedNodeToMenuGroup(created);
+    createMenuGroupId = '';
+    return created;
 }
 shell.addEventListener('mousedown', e => {
     if(!zoomPreviewState) return;
@@ -13085,6 +13828,20 @@ shell.oncontextmenu = e => {
         e.stopPropagation();
         return;
     }
+    if(didPan || e.target.closest('.composer,.smart-back,.asset-panel,.asset-toggle,.smart-log-toggle,.smart-shortcut-toggle,.smart-workflow-toggle,.log-modal,.shortcut-modal,.image-edit-modal,.create-menu,.smart-minimap')) return;
+    if(document.getElementById('imageEditModal')?.classList.contains('open')) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const groupEl = e.target.closest('.image-node.smart-group-node');
+    if(groupEl?.dataset?.id){
+        selectedId = groupEl.dataset.id;
+        selectedIds = [];
+        selectedImage = {nodeId:'', index:-1};
+        openCreateMenu(e, {groupId:groupEl.dataset.id});
+        return;
+    }
+    if(e.target.closest('.image-node')) return;
+    openCreateMenu(e);
 };
 shell.ondblclick = e => {
     if(didPan || e.target.closest('.image-node,.composer,.smart-back,.asset-panel,.asset-toggle,.smart-log-toggle,.smart-shortcut-toggle,.smart-workflow-toggle,.log-modal,.shortcut-modal,.image-edit-modal,.create-menu')) return;
@@ -13208,8 +13965,55 @@ window.onmousemove = e => {
         if(!node) return;
         const dx = (e.clientX - resizeState.startX) / viewport.scale;
         const dy = (e.clientY - resizeState.startY) / viewport.scale;
-        const minW = node.type === 'smart-prompt' ? 260 : node.type === 'smart-loop' ? 252 : 48;
-        const minH = node.type === 'smart-prompt' ? 170 : node.type === 'smart-loop' ? 132 : 48;
+        const minW = node.type === 'smart-prompt' ? 260 : node.type === 'smart-loop' ? 252 : node.type === 'smart-group' ? SMART_GROUP_MIN_WIDTH : 48;
+        const minH = node.type === 'smart-prompt' ? 170 : node.type === 'smart-loop' ? 132 : node.type === 'smart-group' ? SMART_GROUP_MIN_HEIGHT : 48;
+        if(node.type === 'smart-group'){
+            // 分组当“画布中的画布”：拖手柄按宽度方向算出统一缩放比例，组内所有成员（图片+提示词）按相对手势
+            // 起点的快照整体缩放+重排，然后把分组框自动收紧到成员的包围盒——盒子始终贴合内容，右侧不会留空白。
+            const startZoom = resizeState.startZoom || 1;
+            // 目标框宽 = 手柄拖出的框宽；缩放映射以“贴合内容的框宽”为基准，保证两个阶段都线性跟随手柄、衔接连续。
+            const targetW = resizeState.startW + dx;
+            const fitBase = resizeState.contentFitW || resizeState.startW || 1;
+            const desiredZoom = startZoom * (targetW / fitBase);
+            // 成员缩放上限 SMART_GROUP_MAX_MEMBER_ZOOM（默认 1=原始尺寸）：到上限就不再放大成员，改为让分组框继续扩大。
+            const effectiveZoom = Math.max(0.2, Math.min(SMART_GROUP_MAX_MEMBER_ZOOM, desiredZoom));
+            const memberRatio = effectiveZoom / startZoom;
+            const capped = desiredZoom > SMART_GROUP_MAX_MEMBER_ZOOM;
+            node._memberZoom = effectiveZoom;
+            const gx = Number(node.x) || 0, gy = Number(node.y) || 0;
+            const SMART_GROUP_PAD = 16;
+            let maxRight = gx, maxBottom = gy, hasMember = false;
+            (resizeState.members || []).forEach(snap => {
+                const member = nodes.find(n => n.id === snap.id);
+                if(!member) return;
+                hasMember = true;
+                member.x = gx + (snap.sx - gx) * memberRatio;
+                member.y = gy + (snap.sy - gy) * memberRatio;
+                member.w = Math.max(40, Math.round(snap.sw * memberRatio));
+                member.h = Math.max(40, Math.round(snap.sh * memberRatio));
+                if(snap.isImage) member.scale = 1;
+                maxRight = Math.max(maxRight, member.x + member.w);
+                maxBottom = Math.max(maxBottom, member.y + member.h);
+                const memberEl = world.querySelector(`.image-node[data-id="${CSS.escape(member.id)}"]`);
+                if(memberEl){
+                    memberEl.style.left = `${member.x}px`;
+                    memberEl.style.top = `${member.y}px`;
+                }
+                updateNodeElementDuringResize(member);
+            });
+            if(capped || !hasMember){
+                // 成员已到上限（或空分组）：分组框随手柄继续扩大，成员不再放大。
+                node.w = Math.max(minW, Math.round(resizeState.startW + dx));
+                node.h = Math.max(minH, Math.round(resizeState.startH + dy));
+            } else {
+                // 未到上限：分组框收紧到成员包围盒，贴合内容无空白。
+                node.w = Math.max(minW, Math.round(maxRight - gx + SMART_GROUP_PAD));
+                node.h = Math.max(minH, Math.round(maxBottom - gy + SMART_GROUP_PAD));
+            }
+            node.scale = 1;
+            updateNodeElementDuringResize(node);
+            return;
+        }
         node.w = Math.max(minW, Math.round(resizeState.startW + dx));
         node.h = Math.max(minH, Math.round(resizeState.startH + dy));
         node.scale = 1;
@@ -13229,6 +14033,20 @@ window.onmousemove = e => {
         updateNodeElementDuringResize(node);
         const ta = world.querySelector(`.image-node[data-id="${CSS.escape(node.id)}"] .prompt-llm-instruction`);
         if(ta) ta.style.height = `${promptLlmInstructionHeight(node)}px`;
+        return;
+    }
+    if(promptSplitResizeState){
+        const node = nodes.find(n => n.id === promptSplitResizeState.id);
+        if(!node) return;
+        const dy = (e.clientY - promptSplitResizeState.startY) / viewport.scale;
+        const newPreviewH = Math.max(PROMPT_SPLIT_PREVIEW_MIN_H, Math.min(PROMPT_SPLIT_PREVIEW_MAX_H, Math.round(promptSplitResizeState.startH + dy)));
+        node.promptSplitPreviewHeight = newPreviewH;
+        node.h = Math.max(promptNodeMinHeight(node), Math.round(promptSplitResizeState.startNodeH + (newPreviewH - promptSplitResizeState.startH)));
+        node.w = Math.max(Number(node.w) || 0, 316);
+        node.scale = 1;
+        updateNodeElementDuringResize(node);
+        const list = world.querySelector(`.image-node[data-id="${CSS.escape(node.id)}"] .prompt-node-segments`);
+        if(list) list.style.height = `${promptNodeSplitPreviewHeight(node)}px`;
         return;
     }
     if(thumbDragState){
@@ -13293,11 +14111,12 @@ window.onmousemove = e => {
         setAssetDragOver(false);
     }
     const draggedRect = nodeRect(node);
-    const target = (dragState.ctrlGroup || ['smart-image','smart-prompt','smart-loop'].includes(node.type))
+    const rawTarget = dragState.ctrlGroup
         ? (['smart-prompt','smart-loop'].includes(node.type)
             ? dragConnectTargetFor(node, screenToWorld(e))
             : rectOverlapNode(node.id, draggedRect.x, draggedRect.y, draggedRect.width, draggedRect.height, dragState.groupIds))
         : null;
+    const target = isSmartGroupNode(rawTarget) ? null : rawTarget;
     setDropHighlight(target?.id || '');
     moveNodeElementsDuringDrag();
     updateLoopInsertPreview();
@@ -13350,6 +14169,15 @@ window.onmouseup = e => {
         render();
         scheduleSave();
     }
+    if(promptSplitResizeState){
+        const node = nodes.find(n => n.id === promptSplitResizeState.id);
+        const changed = node && promptNodeSplitPreviewHeight(node) !== promptSplitResizeState.startH;
+        document.body.classList.remove('smart-node-resize', 'smart-prompt-split-resize');
+        if(changed) commitPendingUndo(); else discardPendingUndo();
+        promptSplitResizeState = null;
+        render();
+        scheduleSave();
+    }
     if(thumbDragState){
         if(!thumbDragState.detached) discardPendingUndo();
         thumbDragState = null;
@@ -13384,7 +14212,7 @@ window.onmouseup = e => {
             scheduleSave();
             return;
         }
-        const autoTarget = draggedNode ? dragConnectTargetFor(draggedNode, screenToWorld(e)) : null;
+        const autoTarget = draggedNode && dragState.ctrlGroup ? dragConnectTargetFor(draggedNode, screenToWorld(e)) : null;
         const insertHit = draggedNode?.type === 'smart-loop' && dragState.ctrlGroup && (dragState.group || []).length <= 1
             ? insertionConnectionForNode(draggedNode)
             : null;
@@ -13392,6 +14220,7 @@ window.onmouseup = e => {
         const groupTarget = draggedNode && (draggedNode.images || []).length && (dragState.group || []).length <= 1 && draggedRect
             ? rectOverlapNode(draggedNode.id, draggedRect.x, draggedRect.y, draggedRect.width, draggedRect.height, dragState.groupIds)
             : null;
+        const smartGroupTarget = draggedNode && (dragState.group || []).length <= 1 ? smartGroupTargetForDraggedNode(draggedNode) : null;
         if(
             insertHit &&
             insertLoopNodeIntoConnection(draggedNode, insertHit)
@@ -13399,7 +14228,14 @@ window.onmouseup = e => {
             stateChanged = true;
             render();
         } else if(
+            smartGroupTarget &&
+            addDraggedNodeToSmartGroup(draggedNode, smartGroupTarget)
+        ){
+            stateChanged = true;
+            render();
+        } else if(
             groupTarget &&
+            dragState.ctrlGroup &&
             (groupTarget.images || []).length > 1 &&
             mergeImageNodesIntoGroup(draggedNode.id, groupTarget.id)
         ){
@@ -13408,7 +14244,7 @@ window.onmouseup = e => {
         } else if(
             draggedNode &&
             autoTarget &&
-            !dragState.ctrlGroup &&
+            dragState.ctrlGroup &&
             (dragState.group || []).length <= 1 &&
             canAutoConnectDraggedNode(draggedNode, autoTarget) &&
             connectInputNode(draggedNode.id, autoTarget.id)
@@ -13417,14 +14253,15 @@ window.onmouseup = e => {
             restoreDraggedNodePosition();
             if(selectedId === draggedNode.id) selectedId = '';
             render();
-        } else if(draggedNode && (draggedNode.images || []).length && (dragState.ctrlGroup || (dragState.group || []).length <= 1)){
+        } else if(draggedNode && (draggedNode.images || []).length && (dragState.group || []).length <= 1){
             const r = nodeRect(draggedNode);
             const target = rectOverlapNode(draggedNode.id, r.x, r.y, r.width, r.height, dragState.groupIds);
-            if(target && (target.images || []).length && (dragState.ctrlGroup || (target.images || []).length > 1)){
-                stateChanged = true;
-                mergeImageNodesIntoGroup(draggedNode.id, target.id);
-                render();
-            } else if(target && !dragState.ctrlGroup && (dragState.group || []).length <= 1){
+            if(target && isSmartGroupNode(target)){
+                if((dragState.group || []).some(item => {
+                    const n = nodes.find(x => x.id === item.id);
+                    return n && (Math.abs((Number(n.x) || 0) - item.ox) > 1 || Math.abs((Number(n.y) || 0) - item.oy) > 1);
+                })) stateChanged = true;
+            } else if(target && dragState.ctrlGroup && !isSmartGroupNode(target) && canAutoConnectDraggedNode(draggedNode, target)){
                 stateChanged = true;
                 connectInputNode(draggedNode.id, target.id);
                 if(!dragState.thumbDetached) restoreDraggedNodePosition();
@@ -13443,6 +14280,7 @@ window.onmouseup = e => {
             stateChanged = true;
         }
         if(dragState.thumbDetached) stateChanged = true;
+        if(draggedNode && !isSmartGroupNode(draggedNode) && !smartGroupTarget) pruneSmartGroupMembershipsForNode(draggedNode);
         if(stateChanged) commitPendingUndo();
         else discardPendingUndo();
         if(stateChanged || dragState.thumbDetached) suppressNodeClickUntil = Date.now() + 180;
@@ -13454,7 +14292,7 @@ window.onmouseup = e => {
     }
 };
 shell.addEventListener('wheel', e => {
-    if(e.target.closest('.composer,.smart-back,.image-edit-modal,.asset-panel,.asset-toggle,.smart-log-toggle,.smart-shortcut-toggle,.smart-workflow-toggle,.workflow-transfer-panel,.log-modal,.shortcut-modal,[data-thumb-scroll]')) return;
+    if(e.target.closest('.composer,.smart-back,.image-edit-modal,.asset-panel,.asset-toggle,.smart-log-toggle,.smart-shortcut-toggle,.smart-workflow-toggle,.workflow-transfer-panel,.log-modal,.shortcut-modal,.prompt-node-segments,.prompt-node-text,.prompt-node-llm,.smart-group-list,[data-thumb-scroll]')) return;
     e.preventDefault();
     const rect = shell.getBoundingClientRect();
     const sx = e.clientX - rect.left;
@@ -13488,15 +14326,15 @@ shell.ondrop = async e => {
     await handleSmartImageDropPayload(payload, '', {point:p, forceNew:true});
 };
 window.addEventListener('paste', e => {
-    // 素材库管理页「复制到画布」过来的素材：Ctrl+V 批量粘贴成图片节点
-    if(!isEditableTarget(e.target) && pasteAssetsFromInbox()){
-        e.preventDefault();
-        return;
-    }
     const files = [...(e.clipboardData?.files || [])].filter(isSupportedUploadFile);
     if(files.length){
         lastImagePasteAt = Date.now();
         handleFiles(files, selectedId);
+        return;
+    }
+    // 素材库管理页「复制到画布」过来的素材：Ctrl+V 批量粘贴成图片节点
+    if(!isEditableTarget(e.target) && pasteAssetsFromInbox()){
+        e.preventDefault();
         return;
     }
     if(nodeClipboard?.nodes?.length && !isEditableTarget(e.target)){
@@ -13535,11 +14373,6 @@ window.addEventListener('keydown', e => {
         if(selectionText) return;
         e.preventDefault();
         copySelectedNodes();
-        return;
-    }
-    // 素材队列优先于系统剪贴板，避免微信截图等外部图片抢先粘贴。
-    if((e.ctrlKey || e.metaKey) && key === 'v' && !isEditableTarget(e.target) && pasteAssetsFromInbox()){
-        e.preventDefault();
         return;
     }
     if((e.ctrlKey || e.metaKey) && key === 'v' && !isEditableTarget(e.target) && nodeClipboard?.nodes?.length){
@@ -13718,6 +14551,9 @@ assetPanel?.addEventListener('mousedown', e => e.stopPropagation());
 assetPanel?.addEventListener('click', e => e.stopPropagation());
 assetPanel?.addEventListener('wheel', e => {
     e.stopPropagation();
+    // 滚动时取消待显示的悬浮预览并隐藏，避免滚动中加载大图卡顿。
+    clearTimeout(assetHoverTimer);
+    hideAssetHoverPreview();
     const scroller = e.target.closest?.('.asset-grid') || assetGrid;
     if(!scroller || getComputedStyle(scroller).display === 'none') return;
     const canScroll = scroller.scrollHeight > scroller.clientHeight || scroller.scrollWidth > scroller.clientWidth;
@@ -14065,12 +14901,12 @@ promptInput.addEventListener('mouseout', event => {
 mentionPicker.addEventListener('mousedown', event => event.stopPropagation());
 document.addEventListener('click', event => {
     if(!event.target.closest('.smart-control')) closeAllSmartPopovers();
-    if(!event.target.closest('.mention-picker') && !event.target.closest('#promptInput')) closeMentionPicker();
+    if(!event.target.closest('.mention-picker') && !event.target.closest('#promptInput') && !event.target.closest('[data-input-add-reference]')) closeMentionPicker();
     if(!event.target.closest('.prompt-preset-panel') && !event.target.closest('.prompt-preset-edit') && !event.target.closest('.prompt-preset-save')) closePromptPresetPanel();
     if(!event.target.closest('.prompt-template-panel') && !event.target.closest('.prompt-preset-edit') && !event.target.closest('#composerTemplateBtn')) closePromptTemplatePanel();
 });
 document.addEventListener('keydown', event => {
-    if(event.key === 'Escape') { closeAllSmartPopovers(); closeCreateMenu(); closeSmartCanvasLog(); closeSmartCanvasShortcuts(); closePromptPresetPanel(); closePromptTemplatePanel(); }
+    if(event.key === 'Escape') { closeSmartLogLightbox(); closeAllSmartPopovers(); closeCreateMenu(); closeSmartCanvasLog(); closeSmartCanvasShortcuts(); closePromptPresetPanel(); closePromptTemplatePanel(); }
 });
 document.getElementById('cropBox').addEventListener('mousedown', event => beginCropDrag(event, 'move'));
 document.getElementById('cropHandle').addEventListener('mousedown', event => beginCropDrag(event, 'resize'));

@@ -5,6 +5,8 @@ function trf(key, values={}){
     return Object.entries(values).reduce((text, [name, value]) => text.replaceAll(`{${name}}`, String(value)), tr(key));
 }
 function langIsEn(){ return window.StudioI18n?.lang?.() === 'en'; }
+const CANVAS_UPLOAD_MAX = 20;
+const CANVAS_REFERENCE_IMAGE_MAX = 20;
 function actionFailed(labelKey, detail=''){
     const label = tr(labelKey);
     return langIsEn() ? `${label} failed${detail ? `: ${detail}` : ''}` : `${label}失败${detail ? `：${detail}` : ''}`;
@@ -52,7 +54,9 @@ function canvasMediaPreviewUrl(url, size=512){
 function canvasPreviewImgHtml(url, size=512, attrs=''){
     const original = canvasOriginalMediaUrl(url);
     const preview = canvasMediaPreviewUrl(original, size);
-    return `<img src="${escapeAttr(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}" data-url="${escapeAttr(original)}"${attrs ? ` ${attrs}` : ''}>`;
+    // loading=lazy：画布内容多时，视口外的缩略图不加载/不解码，避免一次性解码上百张图卡顿；
+    // decoding=async：解码放到主线程外，渲染时不阻塞。
+    return `<img loading="lazy" decoding="async" src="${escapeAttr(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}" data-url="${escapeAttr(original)}"${attrs ? ` ${attrs}` : ''}>`;
 }
 function loadCanvasOriginalImageDimensions(url){
     const src = String(url || '');
@@ -67,7 +71,7 @@ function loadCanvasOriginalImageDimensions(url){
 function canvasVideoPreviewHtml(url, size=512, attrs=''){
     const original = canvasOriginalMediaUrl(url);
     const preview = canvasMediaPreviewUrl(original, size);
-    return `<img src="${escapeAttr(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}" data-url="${escapeAttr(original)}" data-preview-kind="video"${attrs ? ` ${attrs}` : ''}>`;
+    return `<img loading="lazy" decoding="async" src="${escapeAttr(preview)}" data-preview-src="${escapeAttr(preview)}" data-original-src="${escapeAttr(original)}" data-url="${escapeAttr(original)}" data-preview-kind="video"${attrs ? ` ${attrs}` : ''}>`;
 }
 function canvasVideoFallbackHtml(url, attrs=''){
     const original = canvasOriginalMediaUrl(url);
@@ -265,6 +269,7 @@ let dragBoard = null;
 let minimapDrag = false;
 let minimapState = null;
 let minimapRenderQueued = false;
+let linksRenderQueued = false;
 let zoomPreviewState = null;
 let resizeNode = null;
 let llmPaneDrag = null;
@@ -1035,6 +1040,15 @@ function scheduleMinimapRender(){
     requestAnimationFrame(() => {
         minimapRenderQueued = false;
         renderMinimap();
+    });
+}
+// 拖动/缩放节点时每个 mousemove 都全量重建连线 SVG 会掉帧；用 rAF 合并成每帧最多刷新一次。
+function scheduleLinksRender(){
+    if(linksRenderQueued) return;
+    linksRenderQueued = true;
+    requestAnimationFrame(() => {
+        linksRenderQueued = false;
+        renderLinks();
     });
 }
 function renderMinimap(){
@@ -2809,7 +2823,7 @@ async function runMsGenNode(nodeId, opts={}){
     try {
         const imageUrls = [];
         if(msModel.supportsImage || msModel.acceptsImage){
-            for(const ref of refs.slice(0,3)){
+            for(const ref of refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)){
                 if(ref.url){
                     try { imageUrls.push(await urlToBase64(ref.url)); }
                     catch(e){ imageUrls.push(ref.url); }
@@ -3381,7 +3395,7 @@ function mediaKindForRef(ref){
     return 'image';
 }
 function imageRefsOnly(refs){
-    return (refs || []).filter(ref => ref?.url && mediaKindForRef(ref) === 'image');
+    return (refs || []).filter(ref => ref?.url && mediaKindForRef(ref) === 'image').slice(0, CANVAS_REFERENCE_IMAGE_MAX);
 }
 function videoRefsOnly(refs){
     return (refs || []).filter(ref => ref?.url && mediaKindForRef(ref) === 'video');
@@ -3702,7 +3716,7 @@ async function uploadMediaFiles(files, point, onlyImages=false, opts={}){
     const supported = [...files].filter(file => {
         const kind = mediaKindForUpload(file);
         return onlyImages ? kind === 'image' : ['image','video','audio'].includes(kind);
-    });
+    }).slice(0, CANVAS_UPLOAD_MAX);
     if(!supported.length) return [];
     const form = new FormData();
     supported.forEach(file => form.append('files', file));
@@ -3749,7 +3763,7 @@ async function createImageCardsFromLocalPaths(paths, point){
     if(!ensureCanvas()) return [];
     setStatus(langIsEn() ? 'Importing images...' : '导入图片...');
     try {
-        const files = await importLocalImages(paths);
+        const files = await importLocalImages((paths || []).slice(0, CANVAS_UPLOAD_MAX));
         const base = point || screenToWorld(window.innerWidth / 2, window.innerHeight / 2);
         const created = [];
         files.forEach((file, i) => {
@@ -3786,7 +3800,7 @@ async function applyImageDropPayloadToNode(nodeId, payload){
         return;
     }
     if(payload.type === 'localPaths') {
-        const files = await importLocalImages(payload.localPaths);
+        const files = await importLocalImages((payload.localPaths || []).slice(0, CANVAS_UPLOAD_MAX));
         const file = files[0];
         if(file?.url) {
             pushUndo();
@@ -3840,7 +3854,7 @@ async function handleImageNodeDropEvent(e, nodeId, highlightEl){
 }
 async function fillImageNode(nodeId, files, opts={}){
     if(!ensureCanvas()) return;
-    const imgs = [...files].filter(file => ['image','video','audio'].includes(mediaKindForUpload(file)));
+    const imgs = [...files].filter(file => ['image','video','audio'].includes(mediaKindForUpload(file))).slice(0, CANVAS_UPLOAD_MAX);
     if(!imgs.length) return;
     if(opts.group && imgs.length > 1){
         const source = nodes.find(n => n.id === nodeId);
@@ -5708,8 +5722,7 @@ function renderNode(node){
             node.text = e.target.value;
             refreshPromptCounter(body, node.text);
             scheduleSave();
-            syncGeneratorInputs();
-            refreshGeneratorInputViews();
+            scheduleGeneratorInputSync();
         };
     }
     if(node.type === 'loop') body.appendChild(renderLoopBody(node));
@@ -9652,6 +9665,16 @@ function syncGeneratorInputs(){
         if(gen.type === 'ltxDirector') ltxSyncConnectedImagesToTimeline(gen);
     });
 }
+// 提示词节点每敲一个字都全量重建所有生成器节点的输入/预览 DOM 会卡顿。节点的 text 已即时写入
+// （运行时实时读取，不受影响），生成器里的预览只需稍后同步一次即可，这里做防抖。
+let generatorInputSyncTimer = 0;
+function scheduleGeneratorInputSync(){
+    clearTimeout(generatorInputSyncTimer);
+    generatorInputSyncTimer = setTimeout(() => {
+        syncGeneratorInputs();
+        refreshGeneratorInputViews();
+    }, 160);
+}
 function refreshGeneratorInputViews(){
     nodes.filter(n => CANVAS_GENERATOR_TYPES.includes(n.type)).forEach(gen => {
         const el = nodesEl.querySelector(`.node[data-id="${gen.id}"]`);
@@ -9693,7 +9716,7 @@ async function runGenerator(genId, opts={}){
         provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
         model:resolveImageModel(gen.model),
         size:await generatorSizeForRun(gen, refs),
-        reference_images:refs
+        reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
     };
     const quality = normalizedImageQuality(gen.quality);
     if(quality) payload.quality = quality;
@@ -9789,7 +9812,7 @@ async function runGeneratorLegacy(genId, opts={}){
             provider_id:resolveImageProviderId(gen.apiProvider || 'comfly'),
             model:resolveImageModel(gen.model),
             size:requestSize,
-            reference_images:refs
+            reference_images:refs.slice(0, CANVAS_REFERENCE_IMAGE_MAX)
         };
         const quality = normalizedImageQuality(gen.quality);
         if(quality) payload.quality = quality;
@@ -11398,7 +11421,7 @@ function renderCanvasLog(){
                     <span class="log-chip">${escapeHtml(formatRunDuration(log.runMs || 0))}</span>
                 </div>
                 <div class="log-subline">${subParts.map(part => `<span title="${escapeAttr(part)}">${escapeHtml(part)}</span>`).join('')}</div>
-                ${log.error ? `<div class="log-error" title="${escapeAttr(log.error)}">${escapeHtml(log.error)}</div>` : ''}
+                ${log.error ? `<div class="log-error" title="${escapeAttr(log.error)}" data-error="${escapeAttr(log.error)}">${escapeHtml(log.error)}</div>` : ''}
                 <div class="log-prompt" title="${escapeAttr(log.prompt || tr('canvas.noPromptMeta'))}" data-prompt="${escapeAttr(log.prompt || '')}">${escapeHtml(log.prompt || tr('canvas.noPromptMeta'))}</div>
             </div>
             <div class="log-thumbs">${thumbs}</div>
@@ -11411,20 +11434,24 @@ function renderCanvasLog(){
             openOutputLightbox(el.dataset.url, null);
         };
     });
-    list.querySelectorAll('[data-prompt]').forEach(el => {
-        el.onclick = e => {
-            e.stopPropagation();
-            const text = el.dataset.prompt || '';
-            if(text) navigator.clipboard?.writeText(text).catch(() => {});
-            const oldText = el.textContent;
-            el.textContent = tr('canvas.copied');
-            el.classList.add('copied');
-            setTimeout(() => {
-                el.textContent = oldText;
-                el.classList.remove('copied');
-            }, 900);
-        };
-    });
+    const bindCanvasLogCopy = (selector, key) => {
+        list.querySelectorAll(selector).forEach(el => {
+            el.onclick = e => {
+                e.stopPropagation();
+                const text = el.dataset[key] || '';
+                if(text) navigator.clipboard?.writeText(text).catch(() => {});
+                const oldText = el.textContent;
+                el.textContent = tr('canvas.copied');
+                el.classList.add('copied');
+                setTimeout(() => {
+                    el.textContent = oldText;
+                    el.classList.remove('copied');
+                }, 900);
+            };
+        });
+    };
+    bindCanvasLogCopy('[data-prompt]', 'prompt');
+    bindCanvasLogCopy('[data-error]', 'error');
     refreshIcons();
 }
 async function importWorkflowAssetUrl(url, name='workflow'){
@@ -13080,7 +13107,7 @@ function onNodeDrag(e){
             childEl.style.top = `${childDrag.node.y}px`;
         }
     });
-    renderLinks();
+    scheduleLinksRender();
     renderSelectionHub();
     if(workflowTransferModal?.classList.contains('open')) updateWorkflowTransferMeta();
     scheduleMinimapRender();
@@ -13114,7 +13141,7 @@ function onNodeResize(e){
         el.style.width = `${resizeNode.node.w}px`;
         el.style.height = `${resizeNode.node.h}px`;
     }
-    renderLinks();
+    scheduleLinksRender();
     renderSelectionHub();
     scheduleMinimapRender();
 }
@@ -13366,14 +13393,19 @@ function canResolvePort(id){
 function renderLinks(){
     linksEl.innerHTML = '';
     linkControlsEl.innerHTML = '';
+    // 先批量读取所有端点坐标（portPoint 里有 getBoundingClientRect），再统一写入 DOM。
+    // 否则“读一条 rect → append 一条线”交错进行，每次 append 都让布局失效，下一次读 rect 就触发一次
+    // 全量强制重排（layout thrashing），连线一多拖动就掉帧。读写分离后每帧只强制重排一次。
+    const segments = [];
     connections.forEach(c => {
         // 端点无法解析（节点已删除、或尚未渲染出 DOM）就跳过，否则连线会被画到 (0,0)，
         // 看起来像很多连线都从同一个空白处中转。
         if(!canResolvePort(c.from) || !canResolvePort(c.to)) return;
-        const a = portPoint(c.from, 'out'), b = portPoint(c.to, 'in');
+        segments.push({c, a:portPoint(c.from, 'out'), b:portPoint(c.to, 'in')});
+    });
+    segments.forEach(({c, a, b}) => {
         linksEl.appendChild(pathEl(a.x, a.y, b.x, b.y, 'link'));
-        const btn = linkDeleteButton(c, a, b);
-        linkControlsEl.appendChild(btn);
+        linkControlsEl.appendChild(linkDeleteButton(c, a, b));
         linksEl.appendChild(linkHitEl(a.x, a.y, b.x, b.y, c.id));
     });
     if(tempLink){
