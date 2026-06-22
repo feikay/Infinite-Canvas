@@ -1121,6 +1121,12 @@ function smartGroupMembers(node){
         return true;
     });
 }
+function smartGroupCompactMembers(node){
+    return smartGroupMembers(node).filter(member => member?.type === 'smart-prompt' || member?.type === 'smart-loop');
+}
+function isSmartGroupCompactMember(node){
+    return Boolean(node && (node.type === 'smart-prompt' || node.type === 'smart-loop') && smartGroupContainingNode(node.id));
+}
 // 分组当前缩放比例（1=原始）。分组就像“画布中的画布”：缩放分组时组内所有成员（含提示词）整体等比缩放+
 // 重排。缩放过程用每次手势开始时的快照实时计算（见 resize 处理），不存持久基准，避免移动成员后再缩放位置回退。
 // _memberZoom 仅用于：新入组的成员按它缩小，以匹配已经缩小的分组。
@@ -1235,6 +1241,8 @@ function smartGroupImageRefs(group){
 function smartGroupThumbLayout(node){
     const refs = smartGroupImageRefs(node).filter(ref => ref.item?.url);
     if(!refs.length) return null;
+    const compactMembers = smartGroupCompactMembers(node);
+    const count = refs.length + compactMembers.length;
     const items = refs.map(ref => ref.item);
     const explicitW = Number(node?.w);
     const explicitH = Number(node?.h);
@@ -1243,10 +1251,11 @@ function smartGroupThumbLayout(node){
     const scale = mediaNodeDefaultScale({type:'smart-image', images:items, scale:node?.scale});
     const summarySpace = 28;
     const outerPad = 32;
-    if(refs.length === 1){
+    if(count === 1){
         if(hasExplicit){
             return {
                 refs,
+                compactMembers,
                 cols:1,
                 rows:1,
                 visibleRows:1,
@@ -1261,6 +1270,7 @@ function smartGroupThumbLayout(node){
         const single = singleImageLayout(refs[0].item, {}, scale);
         return {
             refs,
+            compactMembers,
             ...single,
             width:Math.max(SMART_GROUP_MIN_WIDTH, Math.round(single.width + outerPad)),
             height:Math.max(SMART_GROUP_MIN_HEIGHT, Math.round(single.height + outerPad + summarySpace)),
@@ -1269,19 +1279,21 @@ function smartGroupThumbLayout(node){
         };
     }
     const gap = 8;
+    const maxVisibleRows = compactMembers.length ? count : SMART_GROUP_MAX_VISIBLE_ROWS;
     if(hasExplicit){
-        const fitted = groupImageGridLayout(refs.length, Math.max(72, explicitW - outerPad), Math.max(56, explicitH - outerPad - summarySpace), 100000, 0, gap, SMART_GROUP_MAX_VISIBLE_ROWS);
-        return {...fitted, refs, width:Math.round(explicitW), height:Math.round(explicitH)};
+        const fitted = groupImageGridLayout(count, Math.max(72, explicitW - outerPad), Math.max(56, explicitH - outerPad - summarySpace), 100000, 0, gap, maxVisibleRows);
+        return {...fitted, refs, compactMembers, width:Math.round(explicitW), height:Math.round(explicitH)};
     }
     const thumb = Math.round(MEDIA_GROUP_THUMB_BASE * scale);
     const cell = thumb + gap;
-    const cols = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(refs.length))));
-    const rows = Math.ceil(refs.length / cols);
-    const visibleRows = Math.min(SMART_GROUP_MAX_VISIBLE_ROWS, rows);
+    const cols = Math.min(4, Math.max(2, Math.ceil(Math.sqrt(count))));
+    const rows = Math.ceil(count / cols);
+    const visibleRows = Math.min(maxVisibleRows, rows);
     const gridW = cols * thumb + (cols - 1) * gap;
     const gridH = visibleRows * cell - gap;
     return {
         refs,
+        compactMembers,
         cols,
         rows,
         visibleRows,
@@ -1297,8 +1309,42 @@ const SMART_GROUP_ARRANGE_HEADER = 44;
 // 每个成员在所属单元格内居中；最后把分组框尺寸收敛到正好包住所有成员。
 function arrangeSmartGroupMembers(group, options={}){
     if(!isSmartGroupNode(group)) return false;
-    // 图片已收进卡片内的缩略图网格，本身就是整齐自适应的，无需重排（“整理”对图片分组即重新渲染）。
-    if((group.images || []).some(img => img?.url)) return true;
+    const hasThumbImages = smartGroupImageRefs(group).some(ref => ref.item?.url);
+    if(hasThumbImages){
+        const compactMembers = smartGroupCompactMembers(group);
+        if(!options.skipUndo) pushUndo();
+        const layout = smartGroupThumbLayout(group);
+        if(!layout) return true;
+        const refs = layout.refs || [];
+        const thumb = Math.max(28, Math.round(Number(layout.thumb) || 96));
+        const gap = 8;
+        const cols = Math.max(1, Number(layout.cols) || 1);
+        const gridW = cols * thumb + Math.max(0, cols - 1) * gap;
+        const contentW = Math.max(0, Math.round(Number(layout.width) || SMART_GROUP_DEFAULT_WIDTH) - 32);
+        const originX = (Number(group.x) || 0) + 16 + Math.max(0, Math.round((contentW - gridW) / 2));
+        const originY = (Number(group.y) || 0) + 16 + 28;
+        group.w = Math.max(SMART_GROUP_MIN_WIDTH, Math.round(Number(layout.width) || SMART_GROUP_DEFAULT_WIDTH));
+        group.h = Math.max(SMART_GROUP_MIN_HEIGHT, Math.round(Number(layout.height) || SMART_GROUP_DEFAULT_HEIGHT));
+        const ordered = compactMembers.slice().sort((a, b) => {
+            const ra = nodeRect(a), rb = nodeRect(b);
+            const dy = (Number(ra.y) || 0) - (Number(rb.y) || 0);
+            if(Math.abs(dy) > 24) return dy;
+            return (Number(ra.x) || 0) - (Number(rb.x) || 0);
+        });
+        ordered.forEach((member, memberIndex) => {
+            const index = refs.length + memberIndex;
+            const col = index % cols;
+            const row = Math.floor(index / cols);
+            member.x = Math.round(originX + col * (thumb + gap));
+            member.y = Math.round(originY + row * (thumb + gap));
+            member.w = thumb;
+            member.h = thumb;
+            member.scale = 1;
+        });
+        if(group._memberZoom !== undefined) group._memberZoom = 1;
+        if(options.syncDom) syncSmartGroupMemberElements(group);
+        return true;
+    }
     const members = smartGroupMembers(group);
     if(!members.length) return false;
     if(!options.skipUndo) pushUndo();
@@ -1547,6 +1593,9 @@ function promptNodeLayoutSize(node){
     const oldExpandedH = node?.llmSystemEnabled ? 400 : 340;
     const explicitW = Number(node?.w);
     const explicitH = Number(node?.h);
+    if(isSmartGroupCompactMember(node) && Number.isFinite(explicitW) && explicitW > 24 && Number.isFinite(explicitH) && explicitH > 24){
+        return {width:Math.round(explicitW), height:Math.round(explicitH)};
+    }
     const width = !Number.isFinite(explicitW) || explicitW === 360 ? 316 : explicitW;
     const fallbackH = promptNodeMinHeight(node);
     const legacyExpandedH = node?.llmSystemEnabled ? 344 : 292;
@@ -1592,7 +1641,14 @@ function imageLayout(images, scale=1, node=null){
         return {cols:1, rows:1, ...smartGroupLayoutSize(node), thumb:96, single:true};
     }
     if(node?.type === 'smart-prompt') return {cols:1, rows:1, ...promptNodeLayoutSize(node), thumb:96, single:true};
-    if(node?.type === 'smart-loop') return {cols:1, rows:1, width:Math.round(Number(node.w) || smartLoopWidth(node)), height:Math.round(Math.max(Number(node.h) || 0, smartLoopHeight(node))), thumb:96, single:true};
+    if(node?.type === 'smart-loop'){
+        const explicitW = Number(node.w);
+        const explicitH = Number(node.h);
+        if(isSmartGroupCompactMember(node) && Number.isFinite(explicitW) && explicitW > 24 && Number.isFinite(explicitH) && explicitH > 24){
+            return {cols:1, rows:1, width:Math.round(explicitW), height:Math.round(explicitH), thumb:96, single:true};
+        }
+        return {cols:1, rows:1, width:Math.round(Number(node.w) || smartLoopWidth(node)), height:Math.round(Math.max(Number(node.h) || 0, smartLoopHeight(node))), thumb:96, single:true};
+    }
     const count = (images || []).length;
     const s = node?.type === 'smart-image' || !node?.type ? mediaNodeDefaultScale(node) : (Number.isFinite(scale) && scale > 0 ? scale : 1);
     if(count === 0){
@@ -4484,6 +4540,7 @@ const smartClientId = `canvas_smart_${Math.random().toString(36).slice(2, 10)}${
 let canvasSyncInFlight = false;
 let canvasSyncTimer = null;
 let canvasMetaPollTimer = null;
+let connectionLayerRaf = 0;
 function mergeSmartImageLists(localImgs, remoteImgs){
     const out = [];
     const seen = new Set();
@@ -4502,7 +4559,139 @@ function mergeSmartImageLists(localImgs, remoteImgs){
     return out;
 }
 function smartNodeInFlight(node){
+    if(smartNodeHasCompletedResult(node)) return false;
     return Boolean(node && (node.running || node.pending || node.queued || node.jimengPending || smartPendingTasks(node).length));
+}
+function smartNodeHasDisplayResult(node){
+    return Boolean((node?.images || []).some(img => img?.url && !img.loopInputPreview));
+}
+function smartNodeHasCompletedResult(node){
+    if(!smartNodeHasDisplayResult(node)) return false;
+    if(node?.runFinishedAt) return true;
+    return !node?.jimengPending && !smartPendingTasks(node).length && !Number(node?.pending || 0) && !node?.queued;
+}
+function liveSmartNode(node){
+    if(!node?.id) return node;
+    return nodes.find(n => n.id === node.id) || node;
+}
+function clearSmartNodeBusyState(node){
+    if(!node) return node;
+    smartNodeRunTokens.delete(node.id);
+    node.running = false;
+    node.pending = 0;
+    node.queued = false;
+    delete node.jimengPending;
+    delete node.pendingTasks;
+    return node;
+}
+function markSmartNodeComplete(node, meta=null){
+    if(!node) return node;
+    const keepHidden = node.runTimerHidden === true;
+    clearSmartNodeBusyState(node);
+    node.runFinishedAt = Number(node.runFinishedAt || 0) || nowMs();
+    if(!node.runStartedAt) node.runStartedAt = meta?.createdAt || node.runFinishedAt;
+    node.runElapsedMs = Math.max(0, Number(node.runFinishedAt || nowMs()) - Number(node.runStartedAt || node.runFinishedAt || nowMs()));
+    node.runTimerHidden = meta?.hideTimer === true || keepHidden;
+    return node;
+}
+function completedDownstreamOutputForNode(sourceNode){
+    if(!sourceNode?.id) return null;
+    const startedAt = Number(sourceNode.runStartedAt || 0);
+    return downstreamImageTargetsFor(sourceNode).find(target => {
+        if(!smartNodeHasCompletedResult(target)) return false;
+        if(target.sourceNodeId && target.sourceNodeId !== sourceNode.id) return false;
+        const finishedAt = Number(target.runFinishedAt || 0);
+        return !startedAt || !finishedAt || finishedAt >= startedAt;
+    }) || null;
+}
+function clearSourceBusyStateIfDownstreamDone(sourceNode, options={}){
+    if(!sourceNode || !smartNodeInFlight(sourceNode)) return false;
+    if(sourceNode.jimengPending || smartPendingTasks(sourceNode).length) return false;
+    if(!completedDownstreamOutputForNode(sourceNode)) return false;
+    clearSmartNodeBusyState(sourceNode);
+    if(!sourceNode.runFinishedAt){
+        sourceNode.runFinishedAt = nowMs();
+        if(!sourceNode.runStartedAt) sourceNode.runStartedAt = sourceNode.runFinishedAt;
+        sourceNode.runElapsedMs = Math.max(0, sourceNode.runFinishedAt - Number(sourceNode.runStartedAt || sourceNode.runFinishedAt));
+        sourceNode.runTimerHidden = options.hideTimer === true || sourceNode.runTimerHidden === true;
+    }
+    return true;
+}
+function clearCompletedSourceBusyStates(){
+    let changed = false;
+    (nodes || []).forEach(node => {
+        if(clearSourceBusyStateIfDownstreamDone(node)) changed = true;
+    });
+    return changed;
+}
+function hideCompletedRunTimers(){
+    let changed = false;
+    (nodes || []).forEach(node => {
+        if(!node || node.type === 'smart-prompt') return;
+        if(node.pending || node.running || node.jimengPending || !node.runFinishedAt || node.runTimerHidden) return;
+        node.runTimerHidden = true;
+        changed = true;
+    });
+    return changed;
+}
+function clearCompletedNodeBusyStates(){
+    let changed = false;
+    (nodes || []).forEach(node => {
+        if(!node || !smartNodeHasCompletedResult(node) || !smartNodeInFlight(node)) return;
+        markSmartNodeComplete(node);
+        changed = true;
+    });
+    if(clearCompletedSourceBusyStates()) changed = true;
+    return changed;
+}
+function usedCanvasOutputUrls(){
+    const used = new Set();
+    (nodes || []).forEach(node => (node.images || []).forEach(img => {
+        if(img?.url && !img.loopInputPreview) used.add(img.url);
+    }));
+    return used;
+}
+function successfulRecentComfyLogOutputs(sourceNodeId='', withinMs=30 * 60 * 1000){
+    const cutoff = Date.now() - withinMs;
+    const logs = (canvas?.logs || [])
+        .filter(log => log && log.status === 'success' && Number(log.createdAt || 0) >= cutoff)
+        .filter(log => log.request?.workflow_json || String(log.platform || '').toLowerCase().includes('comfy'))
+        .sort((a, b) => Number(a.createdAt || 0) - Number(b.createdAt || 0));
+    const scoped = sourceNodeId ? logs.filter(log => log.nodeId === sourceNodeId) : logs;
+    const usable = scoped.length ? scoped : logs.filter(log => !log.nodeId);
+    return usable.flatMap(log => (log.outputs || []).map(url => ({url, createdAt:log.createdAt, nodeId:log.nodeId}))).filter(item => item.url);
+}
+function recoverStuckLoopOutputsFromLogs(){
+    const used = usedCanvasOutputUrls();
+    let changed = false;
+    const slots = (nodes || [])
+        .filter(node => node && isSmartImageNode(node) && !isHistoryGroupNode(node))
+        .filter(node => (node.loopSourceId || node.loopRootId || Number.isFinite(Number(node.loopSlotIndex))) && !smartNodeHasDisplayResult(node))
+        .filter(node => (node.pending || node.running || node.queued) && !smartPendingTasks(node).length)
+        .sort((a, b) => (Number(a.loopSlotIndex || 0) - Number(b.loopSlotIndex || 0)) || (Number(a.y || 0) - Number(b.y || 0)));
+    slots.forEach(slot => {
+        const sourceId = slot.loopRootId || slot.sourceNodeId || '';
+        const output = successfulRecentComfyLogOutputs(sourceId).find(item => !used.has(item.url));
+        if(!output) return;
+        const kind = mediaKindForUrls([output.url], 'image');
+        const ext = kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : kind === 'text' ? 'txt' : 'png';
+        slot.images = [stripImageGenerationMeta({url:output.url, name:`comfy-recovered-${Number(slot.loopSlotIndex || 0) + 1}.${ext}`, kind, generatedResult:true})];
+        markSmartNodeComplete(slot);
+        if(kind) slot.outputKind = kind;
+        slot.title = slot.title || 'Image';
+        slot.scale = mediaNodeDefaultScale(slot);
+        delete slot.w;
+        delete slot.h;
+        used.add(output.url);
+        changed = true;
+        clearSourceBusyStateIfDownstreamDone(nodes.find(n => n.id === sourceId));
+    });
+    return changed;
+}
+function completeSmartNodeWithImages(node, images){
+    const copy = {...node, images};
+    if(smartNodeHasDisplayResult(copy)) markSmartNodeComplete(copy);
+    return copy;
 }
 function syncRunButtonState(node=selectedNode()){
     if(!runBtn) return;
@@ -4511,12 +4700,27 @@ function syncRunButtonState(node=selectedNode()){
     runBtn.disabled = !isSmartRunnableNode(node) || smartNodeInFlight(node) || smartCascadeIsLoopRunning(node?.id);
 }
 function mergeSmartNode(local, remote){
+    const images = mergeSmartImageLists(local.images, remote.images);
+    const localDone = smartNodeHasCompletedResult(local);
+    const remoteDone = smartNodeHasCompletedResult(remote);
+    const localBusy = smartNodeInFlight(local);
+    const remoteBusy = smartNodeInFlight(remote);
+    if(localDone && remoteBusy && !remoteDone) return completeSmartNodeWithImages(local, images);
+    if(remoteDone && localBusy && !localDone) return completeSmartNodeWithImages(remote, images);
+    if(localDone && remoteDone){
+        const localFinished = Number(local.runFinishedAt || 0);
+        const remoteFinished = Number(remote.runFinishedAt || 0);
+        return completeSmartNodeWithImages(remoteFinished >= localFinished ? remote : local, images);
+    }
     // 本地正在生成/排队的节点完全以本地为准，只把对方可能多出来的图并进来，绝不被对方旧状态冲掉
     if(smartNodeInFlight(local)){
-        return {...local, images:mergeSmartImageLists(local.images, remote.images)};
+        return {...local, images};
     }
     // 否则以对方（最新保存方）的布局/标题/设置为基底，但图片取并集——双方生成结果都不丢
-    return {...remote, images:mergeSmartImageLists(local.images, remote.images)};
+    const merged = {...remote, images};
+    return smartNodeHasDisplayResult(merged) && (merged.pending || merged.queued || smartPendingTasks(merged).length)
+        ? completeSmartNodeWithImages(merged, images)
+        : merged;
 }
 function mergeSmartNodeLists(localNodes, remoteNodes){
     const localById = new Map((localNodes || []).map(n => [n.id, n]));
@@ -4552,6 +4756,8 @@ function applyMergedServerCanvas(serverCanvas){
     const nodeIds = new Set(mergedNodes.map(n => n.id));
     nodes = mergedNodes;
     canvas.connections = mergeSmartConnections(canvas.connections, serverCanvas.connections, nodeIds);
+    const cleanedState = clearCompletedNodeBusyStates();
+    const recoveredLoopOutputs = recoverStuckLoopOutputsFromLogs();
     canvas.updated_at = Number(serverCanvas.updated_at || canvas.updated_at || 0);
     if(canvas.title !== serverCanvas.title && serverCanvas.title){
         canvas.title = serverCanvas.title;
@@ -4559,7 +4765,8 @@ function applyMergedServerCanvas(serverCanvas){
         if(titleEl) titleEl.textContent = canvas.title;
     }
     render();
-    if(typeof refreshConnectionLayer === 'function') refreshConnectionLayer();
+    if(typeof scheduleConnectionLayerRefresh === 'function') scheduleConnectionLayerRefresh();
+    if(cleanedState || recoveredLoopOutputs) scheduleSave();
     resumeSmartPendingTasks();
     resumeJimengPendingNodes();
     return true;
@@ -5131,16 +5338,21 @@ async function loadCanvas(){
         document.getElementById('smartTitle').textContent = canvas.title || tr('canvas.smartCanvas');
         nodes = (Array.isArray(canvas.nodes) ? canvas.nodes : []).map(normalizeLegacySmartNode).filter(Boolean);
         migrateSmartGroupImageMembers();
+        canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
         nodes.forEach(n => {
             const pendingTasks = smartPendingTasks(n);
             if(pendingTasks.length){
                 n.pending = Math.max(pendingTasks.length, Number(n.pending || 0) || pendingTasks.length);
                 n.running = false;
-            } else if(n.pending){
-                n.pending = 0;
+            } else if(smartNodeHasDisplayResult(n)){
+                markSmartNodeComplete(n, {hideTimer:true});
+            } else if(n.pending || n.queued){
+                clearSmartNodeBusyState(n);
             }
         });
-        canvas.connections = Array.isArray(canvas.connections) ? canvas.connections : [];
+        const cleanedCompletedState = clearCompletedNodeBusyStates();
+        const recoveredLoopOutputs = recoverStuckLoopOutputsFromLogs();
+        const hiddenCompletedTimers = hideCompletedRunTimers();
         const cleanedDetachedInputs = cleanupDetachedRunInputRefs();
         viewport = {...viewport, ...(canvas.viewport || {})};
         viewport.scale = safeScale(viewport.scale);
@@ -5156,7 +5368,7 @@ async function loadCanvas(){
         updateProviderModels();
         applyViewport();
         render();
-        if(cleanedDetachedInputs) scheduleSave();
+        if(cleanedDetachedInputs || cleanedCompletedState || recoveredLoopOutputs || hiddenCompletedTimers) scheduleSave();
         resumeSmartPendingTasks();
         resumeJimengPendingNodes();
         startCanvasMetaPoll();
@@ -5433,6 +5645,8 @@ function shellPoint(event){
 function renderConnections(){
     const conns = (canvas?.connections || []).map((conn, index) => ({...conn, index})).filter(c => nodes.some(n => n.id === c.from) && nodes.some(n => n.id === c.to));
     const cascadeKeys = cascadeConnectionKeys();
+    const activeCascadeCount = (smartCascadeRunPath?.states && Object.values(smartCascadeRunPath.states).filter(state => state && state !== 'done').length) || 0;
+    const reduceMotion = activeCascadeCount > 24;
     // 合并连线：同一来源连到同一分组的多个成员，合成一条到分组的连线（A→A1/A2/A3 显示为 A→分组），
     // 减少“每张图都拖一条线”的杂乱。history 连线不合并。
     const buckets = new Map();
@@ -5495,9 +5709,10 @@ function renderConnections(){
         const width = kind === 'input' ? '1.9' : '1.6';
         return `<path class="${cls}" d="${curve}" stroke="${color}" stroke-width="${width}" fill="none" opacity="${opacity}"></path><path class="conn-hit" data-conn-index="${dataIndex}" d="${curve}" stroke="transparent" stroke-width="14" fill="none"></path><circle cx="${tx}" cy="${ty}" r="3.5" fill="${color}" opacity=".66"></circle><g class="conn-cut" data-conn-index="${dataIndex}" transform="translate(${mx} ${my})"><circle r="8" fill="var(--card)" stroke="${color}" stroke-width="1.4"></circle><path d="M-3 -3 L3 3 M3 -3 L-3 3" stroke="${color}" stroke-width="1.5" stroke-linecap="round"></path></g>`;
     }).join('');
-    return `<svg class="connection-layer" width="6000" height="4000" viewBox="0 0 6000 4000" xmlns="http://www.w3.org/2000/svg">${paths}</svg>`;
+    return `<svg class="connection-layer ${reduceMotion ? 'conn-reduce-motion' : ''}" width="6000" height="4000" viewBox="0 0 6000 4000" xmlns="http://www.w3.org/2000/svg">${paths}</svg>`;
 }
 function refreshConnectionLayer(){
+    connectionLayerRaf = 0;
     const oldSvg = world.querySelector('svg.connection-layer');
     if(!oldSvg) return;
     const tpl = document.createElement('template');
@@ -5505,6 +5720,10 @@ function refreshConnectionLayer(){
     const nextSvg = tpl.content.firstElementChild;
     if(nextSvg) oldSvg.replaceWith(nextSvg);
     bindConnectionEvents();
+}
+function scheduleConnectionLayerRefresh(){
+    if(connectionLayerRaf) return;
+    connectionLayerRaf = requestAnimationFrame(refreshConnectionLayer);
 }
 let interactionLayerRaf = 0;
 // 拖动/缩放节点时，每个 mousemove 都全量重建连线 SVG + 小地图会掉帧；
@@ -5562,7 +5781,9 @@ function updateNodeElementDuringResize(node){
             loadingGrid.style.gridTemplateColumns = `repeat(${cols}, 1fr)`;
             loadingGrid.style.gridTemplateRows = `repeat(${rows}, 1fr)`;
         }
-        const maxVisibleRows = isSmartGroupNode(node) ? SMART_GROUP_MAX_VISIBLE_ROWS : MEDIA_GROUP_MAX_VISIBLE_ROWS;
+        const maxVisibleRows = isSmartGroupNode(node)
+            ? (smartGroupCompactMembers(node).length ? Number(layout.rows || 1) : SMART_GROUP_MAX_VISIBLE_ROWS)
+            : MEDIA_GROUP_MAX_VISIBLE_ROWS;
         const grid = body.querySelector('.thumb-grid');
         if(grid){
             grid.style.setProperty('--thumb-cols', layout.cols);
@@ -5593,6 +5814,17 @@ function updateNodeElementDuringResize(node){
     const active = selectedNode();
     if(active?.id === node.id) positionComposerForNode(active);
     scheduleInteractionLayerRefresh();
+}
+function syncSmartGroupMemberElements(group){
+    if(!isSmartGroupNode(group)) return;
+    smartGroupCompactMembers(group).forEach(member => {
+        const el = world.querySelector(`.image-node[data-id="${CSS.escape(member.id)}"]`);
+        if(el){
+            el.style.left = `${member.x || 0}px`;
+            el.style.top = `${member.y || 0}px`;
+        }
+        updateNodeElementDuringResize(member);
+    });
 }
 function isVideoMediaItem(img){
     if(!img) return false;
@@ -6066,6 +6298,7 @@ function addSmartGenerationLog({run, outputs=[], runMs=0, error=''}) {
         createdAt:Date.now(),
         status:error ? 'failed' : 'success',
         platform:smartRunPlatformLabel(run),
+        nodeId:run?.nodeId || '',
         nodeType:run?.nodeType || 'smart-image',
         model:smartRunTaskLabel(run),
         request:smartRunRequestMeta(run),
@@ -6076,6 +6309,7 @@ function addSmartGenerationLog({run, outputs=[], runMs=0, error=''}) {
         error:error ? String(error) : ''
     };
     canvas.logs = [entry, ...canvas.logs].slice(0, 500);
+    if(!error && recoverStuckLoopOutputsFromLogs()) render();
     scheduleSave();
 }
 const SMART_LOG_PREVIEW_NODE_ID = '__smart_log_preview__';
@@ -6400,7 +6634,8 @@ function smartGroupBodyHtml(node){
         counts.loop ? `${counts.loop} 循环` : ''
     ].filter(Boolean).join(' · ') || '双击或拖入图片';
     if(refThumbs.length){
-        if(refThumbs.length === 1){
+        const totalThumbs = Math.max(1, Number(groupThumbLayout?.rows || 1) * Number(groupThumbLayout?.cols || 1));
+        if(totalThumbs === 1 && refThumbs.length === 1){
             const ref = refThumbs[0];
             const innerW = Math.max(24, Number(groupThumbLayout.innerW || groupThumbLayout.width || SMART_GROUP_DEFAULT_WIDTH));
             const innerH = Math.max(24, Number(groupThumbLayout.innerH || groupThumbLayout.height || SMART_GROUP_DEFAULT_HEIGHT));
@@ -6410,7 +6645,8 @@ function smartGroupBodyHtml(node){
                 <div class="image-wrap smart-group-single-thumb ${selectedImage.nodeId === ref.nodeId && Number(selectedImage.index) === Number(ref.index) ? 'image-selected' : ''}" data-ref-node-id="${escapeAttr(ref.nodeId)}" data-ref-image-index="${ref.index}" data-image-index="${ref.index}" data-media-signature="${escapeAttr(`${mediaKindForItem(ref.item)}:${ref.item?.url || ''}`)}" style="--node-img-w:${innerW}px;--node-img-h:${innerH}px">${singleMediaHtml(ref.item, innerW, innerH)}${imageResolutionBadgeHtml(ref.item)}${canDelete ? `<button class="mini-x image-delete" type="button" data-image-index="${ref.index}" title="${escapeHtml(tr('smart.deleteImage'))}"><i data-lucide="trash-2"></i></button>` : ''}</div>
             </div>`;
         }
-        const visibleRows = Math.max(1, Math.min(SMART_GROUP_MAX_VISIBLE_ROWS, Number(groupThumbLayout.visibleRows || groupThumbLayout.rows || 1)));
+        const groupMaxVisibleRows = (groupThumbLayout.compactMembers || []).length ? Number(groupThumbLayout.rows || 1) : SMART_GROUP_MAX_VISIBLE_ROWS;
+        const visibleRows = Math.max(1, Math.min(groupMaxVisibleRows, Number(groupThumbLayout.visibleRows || groupThumbLayout.rows || 1)));
         const maxHeight = Math.max(44, visibleRows * Number(groupThumbLayout.thumb || 96) + Math.max(0, visibleRows - 1) * 8);
         return `<div class="smart-group-card has-thumbs">
             <div class="smart-group-summary"><i data-lucide="group"></i><span>${escapeHtml(summary)}</span></div>
@@ -6694,6 +6930,7 @@ function render(){
         const isPrompt = node.type === 'smart-prompt';
         const isLoop = node.type === 'smart-loop';
         const isSmartGroup = node.type === 'smart-group';
+        const isCompactMember = isSmartGroupCompactMember(node);
         const isImageNode = node.type === 'smart-image' || !node.type;
         const isJimengPending = Boolean(node.jimengPending && node.jimengPending.submitId && imgs.length === 0);
         const isQueued = Boolean(node.queued && imgs.length === 0 && !node.pending && !isJimengPending);
@@ -6704,7 +6941,7 @@ function render(){
         const body = nodeBodyHtml(node, layout);
         const deleteBtn = isGroup ? '' : `<button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button>`;
         const hint = isSmartGroup ? '双击添加 · 拖入归组 · 选中后生成' : isPending ? escapeHtml(tr('smart.hintPending')) : (imgs.length > 1 ? escapeHtml(tr('smart.hintMulti')) : imgs.length ? escapeHtml(tr('smart.hintSingle')) : escapeHtml(tr('smart.hintEmpty')));
-        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
+        const html = `<div class="image-node ${isEmpty ? 'empty-node' : ''} ${isGroup ? 'group-node' : ''} ${isHistory ? 'history-group-node' : ''} ${isPrompt ? 'prompt-smart-node' : ''} ${isLoop ? 'loop-smart-node' : ''} ${isSmartGroup ? 'smart-group-node' : ''} ${isCompactMember ? 'smart-group-member-node' : ''} ${isNodeSelected(node.id) ? 'selected' : ''} ${(dragState?.groupIds?.includes(node.id) || dragState?.id === node.id) ? 'dragging' : ''} ${node.running ? 'node-running' : ''} ${isPending ? 'node-pending' : ''}" data-id="${escapeHtml(node.id)}" style="left:${node.x || 0}px;top:${node.y || 0}px;width:${layout.width}px;height:${layout.height}px">
             <div class="node-head"><div class="node-title">${title}</div><div class="node-actions">${deleteBtn}</div></div>
             ${!isEmpty && !isGroup ? `<div class="floating-node-actions"><button class="mini-x node-delete" type="button" title="${escapeHtml(tr('smart.deleteNode'))}"><i data-lucide="trash-2"></i></button></div>` : ''}
             ${smartNodeToolbarHtml(node)}${smartGroupToolbarHtml(node)}
@@ -7516,16 +7753,21 @@ function bindNodeEvents(){
             openImagePreviewSmart(target.targetNodeId, target.imageIndex);
         }, true);
         });
-        el.querySelectorAll('.thumb-item').forEach(item => {
+        el.querySelectorAll('.thumb-item,.smart-group-single-thumb').forEach(item => {
             item.addEventListener('mousedown', e => {
                 if(e.target.closest('video,audio')) return;
                 if(e.button !== 0 || e.target.closest('.mini-x')) return;
                 if(e.detail >= 2) return;
-                if(item.dataset.refNodeId) return;
                 const node = nodes.find(n => n.id === id);
-                if(!node || (node.images || []).length <= 1) return;
+                const refNodeId = item.dataset.refNodeId || '';
+                if(refNodeId && refNodeId !== id) return;
+                if(!node) return;
+                const imgIndex = Number(item.dataset.imageIndex || 0);
+                if(isSmartGroupNode(node)){
+                    if(!node.images?.[imgIndex]) return;
+                } else if((node.images || []).length <= 1) return;
                 e.preventDefault(); e.stopPropagation();
-                thumbDragState = {nodeId:id, imgIndex:Number(item.dataset.imageIndex || 0), startX:e.clientX, startY:e.clientY, detached:false};
+                thumbDragState = {nodeId:id, imgIndex, startX:e.clientX, startY:e.clientY, detached:false};
                 capturePendingUndo();
             });
         });
@@ -7796,7 +8038,7 @@ function updateLoopInsertPreview(){
     const nextPreview = next ? {index:next.index} : null;
     const changed = (loopInsertPreview?.index ?? -1) !== (nextPreview?.index ?? -1);
     loopInsertPreview = nextPreview;
-    if(changed) refreshConnectionLayer();
+    if(changed) scheduleConnectionLayerRefresh();
     return next;
 }
 function deleteImage(id, imageIndex){
@@ -12101,6 +12343,7 @@ function extractCurrentImagesToSource(node, meta=null){
 }
 function finalizePendingNode(pendingNode, urls, meta, kind='image'){
     if(!pendingNode) return;
+    pendingNode = liveSmartNode(pendingNode);
     const ext = kind === 'video' ? 'mp4' : kind === 'audio' ? 'mp3' : kind === 'text' ? 'txt' : 'png';
     const imgs = urls.map((item, i) => {
         const url = typeof item === 'string' ? item : item?.url || '';
@@ -12108,11 +12351,7 @@ function finalizePendingNode(pendingNode, urls, meta, kind='image'){
         return copyMediaSizeFields(item, {url, name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`, kind:itemKind, generatedResult:true});
     }).filter(img => img.url);
     pendingNode.images = imgs;
-    pendingNode.pending = 0;
-    pendingNode.runFinishedAt = nowMs();
-    if(!pendingNode.runStartedAt) pendingNode.runStartedAt = meta?.createdAt || pendingNode.runFinishedAt;
-    pendingNode.runElapsedMs = Math.max(0, pendingNode.runFinishedAt - Number(pendingNode.runStartedAt || pendingNode.runFinishedAt));
-    pendingNode.runTimerHidden = false;
+    markSmartNodeComplete(pendingNode, meta);
     pendingNode.outputKind = kind;
     if(imgs.length > 1) pendingNode.title = kind === 'video' ? 'Videos' : kind === 'audio' ? 'Audios' : kind === 'text' ? 'Texts' : 'Group';
     else pendingNode.title = kind === 'video' ? 'Video' : kind === 'audio' ? 'Audio' : kind === 'text' ? 'Text' : kind === 'file' ? 'File' : 'Image';
@@ -12122,6 +12361,7 @@ function finalizePendingNode(pendingNode, urls, meta, kind='image'){
     const metaTarget = pendingNode._runMetaTargetId ? nodes.find(n => n.id === pendingNode._runMetaTargetId) : pendingNode;
     if(metaTarget) attachRunMeta(metaTarget, meta);
     pendingNode.images = (pendingNode.images || []).map(img => stripImageGenerationMeta(img));
+    clearSourceBusyStateIfDownstreamDone(nodes.find(n => n.id === meta?.sourceNodeId));
     selectedId = pendingNode._selectAfterRunId || pendingNode.id;
     delete pendingNode._runMetaTargetId;
     delete pendingNode._selectAfterRunId;
@@ -12150,14 +12390,8 @@ function restoreSourceVisualState(node, state){
 }
 function finishLoopTargetPreviewState(node){
     if(!node) return;
-    node.pending = 0;
-    node.running = false;
-    node.queued = false;
-    delete node.pendingTasks;
-    node.runFinishedAt = nowMs();
-    if(!node.runStartedAt) node.runStartedAt = node.runFinishedAt;
-    node.runElapsedMs = Math.max(0, node.runFinishedAt - Number(node.runStartedAt || node.runFinishedAt));
-    node.runTimerHidden = false;
+    node = liveSmartNode(node);
+    markSmartNodeComplete(node);
     if((node.images || []).some(img => img?.url)){
         node.title = node.images.length > 1 ? 'Group' : 'Image';
         node.scale = node.images.length > 1 ? MEDIA_GROUP_DEFAULT_SCALE : MEDIA_NODE_DEFAULT_SCALE;
@@ -12483,10 +12717,12 @@ function cascadeOutputTitle(kind='image', count=1){
     if(Number(count) > 1) return kind === 'video' ? 'Videos' : kind === 'audio' ? 'Audios' : kind === 'text' ? 'Texts' : 'Group';
     return kind === 'video' ? 'Video' : kind === 'audio' ? 'Audio' : kind === 'text' ? 'Text' : kind === 'file' ? 'File' : 'Image';
 }
+function nonPreviewOutputImages(images=[]){
+    return (images || []).filter(img => img?.url && !img.loopInputPreview);
+}
 function cleanHistoryImages(images=[]){
     const seen = new Set();
-    return (images || [])
-        .filter(img => img?.url)
+    return nonPreviewOutputImages(images)
         .map(img => stripImageGenerationMeta({...img}))
         .filter(img => {
             const key = `${img.kind || ''}|${img.url || ''}`;
@@ -12557,6 +12793,7 @@ function ensureHistoryGroupForNode(node){
 }
 function replaceOutputsToNodeWithHistory(node, additions, kind='image', meta=null, options={}){
     if(!node || !additions?.length) return [];
+    node = liveSmartNode(node);
     const beforeRight = (Number(node.x) || 0) + nodeRect(node).width;
     const existing = cleanHistoryImages(node.images || []);
     const next = cleanHistoryImages(additions);
@@ -12572,13 +12809,7 @@ function replaceOutputsToNodeWithHistory(node, additions, kind='image', meta=nul
         delete history.h;
     }
     node.images = next;
-    node.pending = 0;
-    node.running = false;
-    delete node.pendingTasks;
-    node.runFinishedAt = nowMs();
-    if(!node.runStartedAt) node.runStartedAt = meta?.createdAt || node.runFinishedAt;
-    node.runElapsedMs = Math.max(0, node.runFinishedAt - Number(node.runStartedAt || node.runFinishedAt));
-    node.runTimerHidden = false;
+    markSmartNodeComplete(node, meta);
     node.outputKind = kind;
     node.title = cascadeOutputTitle(kind, node.images.length);
     node.scale = node.images.length > 1 ? MEDIA_GROUP_DEFAULT_SCALE : MEDIA_NODE_DEFAULT_SCALE;
@@ -12593,16 +12824,12 @@ function replaceOutputsToNodeWithHistory(node, additions, kind='image', meta=nul
 }
 function appendOutputsToNode(node, additions, kind='image', options={}){
     if(!node || !additions?.length) return [];
+    node = liveSmartNode(node);
     const beforeRight = (Number(node.x) || 0) + nodeRect(node).width;
-    const existing = (node.images || []).filter(img => img?.url).map(img => stripImageGenerationMeta(img));
+    const existing = nonPreviewOutputImages(node.images).map(img => stripImageGenerationMeta({...img}));
     const next = additions.map(img => stripImageGenerationMeta({...img}));
     node.images = [...existing, ...next];
-    node.pending = 0;
-    node.running = false;
-    node.runFinishedAt = nowMs();
-    if(!node.runStartedAt) node.runStartedAt = node.runFinishedAt;
-    node.runElapsedMs = Math.max(0, node.runFinishedAt - Number(node.runStartedAt || node.runFinishedAt));
-    node.runTimerHidden = false;
+    markSmartNodeComplete(node);
     node.outputKind = kind;
     node.title = node.images.length > 1 ? (kind === 'video' ? 'Videos' : kind === 'audio' ? 'Audios' : kind === 'text' ? 'Texts' : 'Group') : (kind === 'video' ? 'Video' : kind === 'audio' ? 'Audio' : kind === 'text' ? 'Text' : kind === 'file' ? 'File' : 'Image');
     delete node.w;
@@ -12674,6 +12901,8 @@ async function waitSmartComfyTaskResult(taskId){
         const res = await fetch(`/api/canvas-comfy-tasks/${encodeURIComponent(taskId)}`);
         if(!res.ok) throw new Error(await smartResponseErrorMessage(res, tr('smart.errRunFailed')));
         const data = await res.json();
+        const readyResult = data?.result || data?.outputs || data?.images || data?.videos || data?.audios || data?.texts;
+        if(readyResult && resultMediaUrls(readyResult).length) return data.result || data;
         if(data.status === 'succeeded') return data.result || {};
         if(data.status === 'failed') throw new Error(data.error || tr('smart.errRunFailed'));
         await sleep(1600);
@@ -12896,6 +13125,7 @@ async function runCascadeStepIntoNode(sourceNode, targetNode, inputRefs, ctx=sma
 }
 async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, ctx){
     if(!loopNode || !rootNode || !outputSlot) return [];
+    outputSlot = liveSmartNode(outputSlot);
     const previousSettings = cloneSmartSettings(settings);
     const edgeKey = `${rootNode.id}->${outputSlot.id}`;
     const runSettings = {...cloneSmartSettings(settings), ...cloneSmartSettings(smartSettingsForNode(rootNode) || {})};
@@ -12931,7 +13161,7 @@ async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, c
         const runPath = smartCascadePathForCtx(ctx);
         if(runPath?.states) {
             runPath.states[edgeKey] = 'active';
-            refreshConnectionLayer();
+            scheduleConnectionLayerRefresh();
         }
         render();
         settings = previousSettings;
@@ -12977,11 +13207,16 @@ async function runLoopRoundIntoSlot(loopNode, rootNode, outputSlot, loopIndex, c
                 const url = typeof item === 'string' ? item : item?.url || '';
                 return stripImageGenerationMeta(copyMediaSizeFields(item, {url, name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`, kind:(typeof item === 'object' && item.kind) || result.kind, generatedResult:true}));
             }).filter(item => item.url);
+            outputSlot = liveSmartNode(outputSlot);
+            outputSlot.images = nonPreviewOutputImages(outputSlot.images);
             replaceOutputsToNodeWithHistory(outputSlot, additions, result.kind, meta, {skipShift:Boolean(ctx?.nodeId)});
         }
+        outputSlot = liveSmartNode(outputSlot);
+        markSmartNodeComplete(outputSlot, meta);
+        clearSourceBusyStateIfDownstreamDone(rootNode);
         if(runPath?.states) {
             runPath.states[edgeKey] = 'done';
-            refreshConnectionLayer();
+            scheduleConnectionLayerRefresh();
         }
         addSmartGenerationLog({run:{...runLog, kind:result.kind || logKind}, outputs:result.urls, runMs:nowMs() - runLogStart});
         return rememberRoundOutputs(ctx, outputSlot, additions);
@@ -13126,7 +13361,7 @@ async function runSmartCascade(targetNode=null){
         graph.edges.forEach(edge => { runStates[edge.key] = 'wait'; });
         runState.runPath = {states:runStates};
         smartCascadeRunPath = runState.runPath;
-        refreshConnectionLayer();
+        scheduleConnectionLayerRefresh();
         updateComposer();
     }
     try {
@@ -13161,7 +13396,7 @@ async function runSmartCascade(targetNode=null){
                     sourceLoopPrompts.forEach(loopNode => {
                         runState.runPath.states[`${loopNode.id}->${source.id}`] = 'done';
                     });
-                    refreshConnectionLayer();
+                    scheduleConnectionLayerRefresh();
                 }
                 if(loopPrompts.length && targets.length > 1){
                     const firstLoop = loopPrompts[0];
@@ -13170,7 +13405,7 @@ async function runSmartCascade(targetNode=null){
                     const selectedTarget = targets[(currentIndex - 1) % targets.length];
                     if(runState.runPath && firstLoop?.id && source?.id){
                         runState.runPath.states[`${firstLoop.id}->${source.id}`] = 'done';
-                        refreshConnectionLayer();
+                        scheduleConnectionLayerRefresh();
                     }
                     targets = [selectedTarget].filter(Boolean);
                 }
@@ -13193,11 +13428,11 @@ async function runSmartCascade(targetNode=null){
                             relayLoops.forEach(loopNode => {
                                 runState.runPath.states[`${loopNode.id}->${source.id}`] = 'done';
                             });
-                            refreshConnectionLayer();
+                            scheduleConnectionLayerRefresh();
                         }
                         if(runState.runPath){
                             runState.runPath.states[edgeKey] = 'active';
-                            refreshConnectionLayer();
+                            scheduleConnectionLayerRefresh();
                         }
                         if(target.type === 'smart-loop'){
                             outputs = outputImagesForNode(source, true, ctx).filter(img => img?.url);
@@ -13220,7 +13455,7 @@ async function runSmartCascade(targetNode=null){
                     }
                     if(runState.runPath){
                         runState.runPath.states[edgeKey] = 'done';
-                        refreshConnectionLayer();
+                        scheduleConnectionLayerRefresh();
                     }
                     const refs = target.type === 'smart-loop' ? sharedRefs : (index === 0 ? sharedRefs : cascadeRefsFromOutputs(outputs, target));
                     producedRefs.set(target.id, refs);
@@ -13772,8 +14007,8 @@ async function comfyNameForRef(ref){
         return r.json();
     });
     const name = data.files?.[0]?.comfy_name || ref.name || ref.url;
-    const node = selectedNode();
-    const image = node?.images?.find(img => img.url === ref.url);
+    const node = ref.nodeId ? nodes.find(n => n.id === ref.nodeId) : null;
+    const image = node?.images?.find(img => img.url === ref.url) || (nodes || []).flatMap(n => n.images || []).find(img => img?.url === ref.url);
     if(image) image.comfy_name = name;
     ref.comfy_name = name;
     return name;
@@ -14040,7 +14275,7 @@ function finalizeSmartPendingTask(node, taskId, images, kind='image'){
         const itemKind = (typeof item === 'object' && item.kind) || kind;
         return stripImageGenerationMeta(copyMediaSizeFields(item, {url, name:(typeof item === 'object' && item.name) || `output-${i + 1}.${ext}`, kind:itemKind, generatedResult:true}));
     }).filter(item => item.url);
-    node.images = [...(node.images || []).map(img => stripImageGenerationMeta(img)), ...additions];
+    node.images = [...nonPreviewOutputImages(node.images).map(img => stripImageGenerationMeta({...img})), ...additions];
     if(additions.length) node.outputKind = kind;
     if(!node.pending && smartPendingTasks(node).length === 0){
         delete node.pendingTasks;
@@ -14554,6 +14789,7 @@ window.onmousemove = e => {
             // 否则拖动过程里会按成员包围盒/缩放比例收缩，松手才回到拖动宽度（用户反馈的“变宽时先缩小”）。
             node.w = Math.max(minW, Math.round(resizeState.startW + dx));
             node.h = Math.max(minH, Math.round(resizeState.startH + dy));
+            if(smartGroupCompactMembers(node).length) arrangeSmartGroupMembers(node, {skipUndo:true, syncDom:true});
             updateNodeElementDuringResize(node);
             return;
         }
@@ -14644,14 +14880,17 @@ window.onmousemove = e => {
         const dy = e.clientY - thumbDragState.startY;
         const source = nodes.find(n => n.id === thumbDragState.nodeId);
         if(!thumbDragState.detached && Math.abs(dx) + Math.abs(dy) > 6){
-            if(source && (source.images || []).length > 1){
+            const canDetachThumb = source && (isSmartGroupNode(source) ? (source.images || []).length >= 1 : (source.images || []).length > 1);
+            if(canDetachThumb){
                 const img = source.images[thumbDragState.imgIndex];
                 if(img){
                     commitPendingUndo();
                     undoSuppressed = true;
                     applyNodeMetaToImage(img, source);
                     source.images.splice(thumbDragState.imgIndex, 1);
-                    if(source.images.length <= 1){
+                    if(isSmartGroupNode(source)){
+                        arrangeSmartGroupMembers(source, {skipUndo:true, syncDom:true});
+                    } else if(source.images.length <= 1){
                         source.title = 'Image';
                         delete source.w; delete source.h;
                         inheritNodeMetaFromImage(source);
@@ -14885,7 +15124,7 @@ window.onmouseup = e => {
         loopInsertPreview = null;
         dragState = null;
         scheduleSave();
-        refreshConnectionLayer();
+        scheduleConnectionLayerRefresh();
     }
 };
 shell.addEventListener('wheel', e => {
