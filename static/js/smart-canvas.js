@@ -2309,9 +2309,44 @@ function restoreOpenControl(state){
     if(state.pinned) match.classList.add('pinned');
     if(state.interacting) match.classList.add('interacting');
 }
+function dynamicParamsScrollSnapshot(){
+    if(!dynamicParams) return null;
+    return {
+        top:dynamicParams.scrollTop || 0,
+        left:dynamicParams.scrollLeft || 0,
+        sizePickers:[...dynamicParams.querySelectorAll('.size-picker-control')].map(ctrl => ({
+            key:controlTypeKey(ctrl),
+            lists:[...ctrl.querySelectorAll('.size-picker-list')].map(list => ({top:list.scrollTop || 0, left:list.scrollLeft || 0}))
+        }))
+    };
+}
+function restoreDynamicParamsScroll(snapshot){
+    if(!snapshot || !dynamicParams) return;
+    const apply = () => {
+        dynamicParams.scrollTop = snapshot.top || 0;
+        dynamicParams.scrollLeft = snapshot.left || 0;
+        const used = new Set();
+        (snapshot.sizePickers || []).forEach(item => {
+            const pickers = [...dynamicParams.querySelectorAll('.size-picker-control')];
+            const index = pickers.findIndex((ctrl, i) => !used.has(i) && (!item.key || controlTypeKey(ctrl) === item.key));
+            if(index < 0) return;
+            used.add(index);
+            const lists = pickers[index].querySelectorAll('.size-picker-list');
+            (item.lists || []).forEach((pos, listIndex) => {
+                const list = lists[listIndex];
+                if(!list) return;
+                list.scrollTop = pos.top || 0;
+                list.scrollLeft = pos.left || 0;
+            });
+        });
+    };
+    apply();
+    requestAnimationFrame(apply);
+}
 function renderDynamicParams(){
     if(!dynamicParams) return;
     const keepOpen = openControlState();
+    const scrollState = dynamicParamsScrollSnapshot();
     settings.engine = ['api','volcengine','modelscope','comfy','runninghub'].includes(settings.engine) ? settings.engine : 'api';
     settings.apiKind = settings.apiKind === 'video' ? 'video' : 'image';
     clearVolcengineSelectionOutsideVolcengine(settings);
@@ -2330,6 +2365,7 @@ function renderDynamicParams(){
     else renderComfyParams();
     bindDynamicParams();
     restoreOpenControl(keepOpen);
+    restoreDynamicParamsScroll(scrollState);
     updatePromptPlaceholder();
     persistActiveSmartSettings();
     if(window.lucide) lucide.createIcons();

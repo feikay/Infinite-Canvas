@@ -269,6 +269,7 @@ RUNNINGHUB_DEFAULT_BASE_URL = "https://www.runninghub.cn"
 RUNNINGHUB_OPENAPI_BASE_URL = "https://www.runninghub.cn/openapi/v2"
 RUNNINGHUB_MODEL_REGISTRY_URL = "https://raw.githubusercontent.com/HM-RunningHub/ComfyUI_RH_OpenAPI/main/models_registry.json"
 RUNNINGHUB_LLM_BASE_URL = "https://llm.runninghub.cn/v1"
+LINGJING_DEFAULT_BASE_URL = "https://apistudio.vip"
 RUNNINGHUB_LLM_MODELS_URLS = [
     "https://llm.runninghub.cn/v1/models",
     "https://llm.runninghub.ai/v1/models",
@@ -753,6 +754,23 @@ def default_api_providers():
             "volcengine_project_name": VOLCENGINE_DEFAULT_PROJECT_NAME,
             "volcengine_region": VOLCENGINE_DEFAULT_REGION,
         },
+        {
+            "id": "lingjing",
+            "name": "灵境API",
+            "base_url": LINGJING_DEFAULT_BASE_URL,
+            "protocol": "openai",
+            "image_request_mode": "openai",
+            "image_generation_endpoint": "",
+            "image_edit_endpoint": "",
+            "enabled": True,
+            "primary": False,
+            "image_models": ["gpt-image-2", "gemini-3.1-flash-image-preview", "gemini-3-pro-image-preview"],
+            "chat_models": ["gpt-5.5"],
+            "video_models": ["veo3.1-fast"],
+            "model_protocols": {"gemini-3.1-flash-image-preview": "gemini", "gemini-3-pro-image-preview": "gemini"},
+            "ms_loras": [],
+            "ms_defaults_version": 0,
+        },
     ]
 
 def merge_default_api_providers(providers):
@@ -814,6 +832,23 @@ def merge_default_api_providers(providers):
             current["protocol"] = "volcengine"
             current["volcengine_project_name"] = str(current.get("volcengine_project_name") or VOLCENGINE_DEFAULT_PROJECT_NAME).strip() or VOLCENGINE_DEFAULT_PROJECT_NAME
             current["volcengine_region"] = str(current.get("volcengine_region") or VOLCENGINE_DEFAULT_REGION).strip() or VOLCENGINE_DEFAULT_REGION
+    lingjing_default = next((d for d in default_api_providers() if d["id"] == "lingjing"), None)
+    if lingjing_default:
+        current = next((item for item in merged if item.get("id") == "lingjing"), None)
+        if not current:
+            merged.append(lingjing_default)
+        else:
+            if not current.get("base_url"):
+                current["base_url"] = lingjing_default["base_url"]
+            if not current.get("protocol"):
+                current["protocol"] = "openai"
+            current["image_request_mode"] = normalize_image_request_mode(current.get("image_request_mode"))
+            current["image_models"] = model_list_from_values([*(current.get("image_models") or []), *(lingjing_default.get("image_models") or [])])
+            current["chat_models"] = model_list_from_values([*(current.get("chat_models") or []), *(lingjing_default.get("chat_models") or [])])
+            current["video_models"] = model_list_from_values([*(current.get("video_models") or []), *(lingjing_default.get("video_models") or [])])
+            protocols = normalize_model_protocols(current.get("model_protocols"))
+            protocols.update(normalize_model_protocols(lingjing_default.get("model_protocols")))
+            current["model_protocols"] = protocols
     # 即梦 CLI 不再是强制保留的默认平台：仅在用户已添加了即梦协议的平台时，规范化其默认模型/地址。
     for current in merged:
         if not is_jimeng_provider(current):

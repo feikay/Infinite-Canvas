@@ -413,15 +413,16 @@ video.node-img { object-fit:cover; background:#0f172a; }
 .connection-layer .conn-hit { pointer-events:stroke; cursor:pointer; }
 .connection-layer .conn-cut { pointer-events:auto; cursor:pointer; opacity:.55; transition:opacity .14s ease; }
 .connection-layer .conn-cut:hover { opacity:1; }
-.connection-layer .conn-pending { stroke-dasharray:5 4; }
+.connection-layer .conn-pending { stroke-dasharray:5 4; animation:dash-flow-pending .9s linear infinite; }
 .connection-layer .conn-cascade { filter:none; }
 .connection-layer .conn-cascade-wait { stroke-dasharray:7 6; opacity:.58; }
-.connection-layer .conn-cascade-active { stroke-dasharray:7 6; animation:dash-flow 1.35s linear infinite; opacity:1; }
+.connection-layer .conn-cascade-active { stroke-dasharray:7 6; animation:dash-flow .9s linear infinite; opacity:1; }
 .connection-layer.conn-reduce-motion .conn-pending,
 .connection-layer.conn-reduce-motion .conn-cascade-active { animation:none; stroke-dashoffset:0; }
 .connection-layer .conn-cascade-done { stroke-dasharray:none; opacity:1; }
 .connection-layer .conn-history { stroke-dasharray:6 5; }
 @keyframes dash-flow { to { stroke-dashoffset:-13; } }
+@keyframes dash-flow-pending { to { stroke-dashoffset:-9; } }
 .image-node { z-index:2; }
 .image-node.smart-group-node { z-index:0; }
 .image-node.selected:not(.smart-group-node) { z-index:10; }
