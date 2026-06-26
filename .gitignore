@@ -1,0 +1,18 @@
+# Python bytecode / cache
+__pycache__/
+*.py[cod]
+*.pyo
+
+# Vendored runtime environment (keep python.exe/.dll/.pyd tracked, ignore installed libs)
+python/Lib/
+python/Scripts/
+python/pip/
+
+# Local env / secrets
+API/.env
+.env
+
+# Editor / OS cruft
+.DS_Store
+Thumbs.db
+*.log
