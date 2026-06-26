@@ -4621,10 +4621,22 @@ async def generate_jimeng_video(payload: CanvasVideoRequest, provider):
 IMAGE_TASK_SUCCESS_STATUSES = {"SUCCESS", "SUCCESSFUL", "SUCCEED", "SUCCEEDED", "COMPLETED", "COMPLETE", "DONE", "FINISHED", "OK", "READY"}
 IMAGE_TASK_FAILED_STATUSES = {"FAILURE", "FAILED", "FAIL", "ERROR", "ERRORED", "CANCELED", "CANCELLED", "TIMEOUT", "REJECTED", "EXPIRED"}
 
+def apimart_custom_prefix(provider):
+    """从 image_generation_endpoint 推导 apimart 协议的路径前缀（如 /v1/cool/generate → /v1/cool）。"""
+    endpoint = str((provider or {}).get("image_generation_endpoint") or "").strip()
+    if endpoint and not re.match(r"^https?://", endpoint, re.I):
+        parts = endpoint.rstrip("/").rsplit("/", 1)
+        if len(parts) == 2 and parts[0].startswith("/"):
+            return parts[0]
+    return ""
+
 def image_task_url_for_provider(provider, task_id):
     base_url = (provider.get("base_url") if provider else AI_BASE_URL).rstrip("/")
     is_apimart = is_apimart_provider(provider)
     if is_apimart:
+        prefix = apimart_custom_prefix(provider)
+        if prefix:
+            return f"{base_url}{prefix}/task/{task_id}"
         return f"{base_url}/tasks/{task_id}" if base_url.endswith("/v1") else f"{base_url}/v1/tasks/{task_id}"
     return f"{base_url}/images/tasks/{task_id}" if base_url.endswith("/v1") else f"{base_url}/v1/images/tasks/{task_id}"
 
@@ -10407,6 +10419,7 @@ class TestConnectionPayload(BaseModel):
     provider_id: str = ""
     protocol: str = "openai"
     image_request_mode: str = "openai"
+    image_generation_endpoint: str = ""
 
 def protocol_from_payload(payload):
     provider_id = str(getattr(payload, "provider_id", "") or "").strip().lower()
@@ -10589,17 +10602,25 @@ def classify_upstream_model(mid):
     return "chat"
 
 def parse_upstream_models(raw, protocol="openai"):
-    items = raw.get("data") if isinstance(raw, dict) else None
-    if not items and isinstance(raw, dict):
-        items = raw.get("models") or raw.get("list") or []
+    # 支持顶层是数组（如 COOL /v1/cool/models 直接返回 [{key, display_name, media_type}, ...]）
+    if isinstance(raw, list):
+        items = raw
+    else:
+        items = raw.get("data") if isinstance(raw, dict) else None
+        if not items and isinstance(raw, dict):
+            items = raw.get("models") or raw.get("list") or []
     if not isinstance(items, list):
         items = []
     ids = []
+    # media_type 显式分类映射（COOL 等平台直接提供，比名称匹配更准确）
+    explicit_types = {}
     for it in items:
+        media_type = ""
         if isinstance(it, str):
             mid = it
         elif isinstance(it, dict):
-            mid = it.get("id") or it.get("name") or it.get("model")
+            mid = it.get("id") or it.get("name") or it.get("model") or it.get("key")
+            media_type = str(it.get("media_type") or it.get("type") or "").strip().lower()
         else:
             mid = ""
         if mid:
@@ -10607,10 +10628,15 @@ def parse_upstream_models(raw, protocol="openai"):
             if protocol == "gemini" and mid.startswith("models/"):
                 mid = mid[len("models/"):]
             ids.append(mid)
+            if media_type in ("image", "video", "chat"):
+                explicit_types[mid] = media_type
     ids = sorted(set(ids))
     grouped = {"image": [], "chat": [], "video": []}
     for mid in ids:
-        grouped[classify_upstream_model(mid)].append(mid)
+        if mid in explicit_types:
+            grouped[explicit_types[mid]].append(mid)
+        else:
+            grouped[classify_upstream_model(mid)].append(mid)
     return grouped, ids
 
 def apply_agnes_model_defaults(base_url, grouped, ids):
@@ -10631,6 +10657,16 @@ def apply_agnes_model_defaults(base_url, grouped, ids):
 async def test_provider_connection(payload: TestConnectionPayload):
     """测试请求地址是否可用：调上游 /v1/models。验证通过时同时把模型清单按类别返回，避免再调一次拉取接口。"""
     protocol = protocol_from_payload(payload)
+    # 校对协议：若已保存 provider 的协议与 payload 不一致，以已保存的为准
+    if payload.provider_id:
+        try:
+            saved = next((p for p in load_api_providers() if p.get("id") == payload.provider_id), None)
+            if saved:
+                saved_protocol = str(saved.get("protocol") or "").strip().lower()
+                if saved_protocol and saved_protocol in SUPPORTED_PROVIDER_PROTOCOLS and saved_protocol != protocol:
+                    protocol = saved_protocol
+        except Exception:
+            pass
     if protocol == "jimeng":
         status = await jimeng_status()
         return {
@@ -10669,6 +10705,21 @@ async def test_provider_connection(payload: TestConnectionPayload):
         key_name = "方舟 API Key" if protocol == "volcengine" else "API Key"
         raise HTTPException(status_code=400, detail=f"请先填写或保存 {key_name}")
     url = upstream_models_url(base_url, protocol)
+    # APIMart 协议：优先用 payload 携带的 image_generation_endpoint，其次查已保存 provider
+    if protocol == "apimart":
+        prefix = ""
+        payload_endpoint = str(getattr(payload, "image_generation_endpoint", "") or "").strip()
+        if payload_endpoint:
+            prefix = apimart_custom_prefix({"image_generation_endpoint": payload_endpoint})
+        if not prefix and payload.provider_id:
+            try:
+                saved = next((p for p in load_api_providers() if p.get("id") == payload.provider_id), None)
+                if saved:
+                    prefix = apimart_custom_prefix(saved)
+            except Exception:
+                pass
+        if prefix:
+            url = f"{base_url}{prefix}/models"
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(url, headers=upstream_model_headers(api_key, protocol))
@@ -10699,7 +10750,7 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 detected, probe = await probe_volcengine_auto_detect(client, base_url, api_key)
                 if detected:
                     return volcengine_default_model_payload(status=resp.status_code, raw=data)
-            return {
+            result = {
                 "ok": True,
                 "status": resp.status_code,
                 "model_count": len(ids),
@@ -10709,6 +10760,7 @@ async def test_provider_connection(payload: TestConnectionPayload):
                 "all": ids,
                 "image_request_mode": detect_image_request_mode(base_url, ids) or normalize_image_request_mode(getattr(payload, "image_request_mode", "")),
             }
+            return result
     except httpx.HTTPError as e:
         if protocol == "volcengine":
             try:
@@ -10764,6 +10816,16 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
             raise HTTPException(status_code=502, detail=str(e)[:300])
     tasks_base = base_url if base_url.endswith("/v1") else f"{base_url}/v1"
     probe_url = f"{tasks_base}/tasks/healthcheck_probe_do_not_submit"
+    # APIMart 协议：若已保存的 provider 有自定义 image_generation_endpoint，从中推导 task probe URL
+    if protocol == "apimart" and payload.provider_id:
+        try:
+            saved = next((p for p in load_api_providers() if p.get("id") == payload.provider_id), None)
+            if saved:
+                prefix = apimart_custom_prefix(saved)
+                if prefix:
+                    probe_url = f"{base_url}{prefix}/task/healthcheck_probe_do_not_submit"
+        except Exception:
+            pass
     try:
         async with httpx.AsyncClient(timeout=15) as client:
             resp = await client.get(probe_url, headers={"Authorization": bearer_auth_value(api_key), "Accept": "application/json"})
@@ -10849,7 +10911,7 @@ async def probe_async_endpoint(payload: TestConnectionPayload):
     except httpx.HTTPError as e:
         raise HTTPException(status_code=502, detail=str(e)[:300])
 
-async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str = "openai", image_request_mode: str = "openai"):
+async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str = "openai", image_request_mode: str = "openai", models_url_override: str = ""):
     """从上游模型列表端点拉取模型，并按名称做轻量分类。"""
     protocol = protocol if protocol in SUPPORTED_PROVIDER_PROTOCOLS else "openai"
     if protocol == "jimeng":
@@ -10872,7 +10934,7 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
     if not api_key:
         key_name = "方舟 API Key" if protocol == "volcengine" else "API Key"
         raise HTTPException(status_code=400, detail=f"请先填写或保存 {key_name}")
-    url = upstream_models_url(base_url, protocol)
+    url = upstream_models_url(base_url, protocol) if not models_url_override else f"{base_url}{models_url_override}"
     try:
         async with httpx.AsyncClient(timeout=30) as client:
             resp = await client.get(url, headers=upstream_model_headers(api_key, protocol))
@@ -10959,7 +11021,7 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
             "message": payload["message"],
             "raw": payload["raw"],
         }
-    return {
+    result = {
         "total": len(ids),
         "image_models": grouped["image"],
         "chat_models": grouped["chat"],
@@ -10967,13 +11029,34 @@ async def fetch_models_from_upstream(base_url: str, api_key: str, protocol: str 
         "all": ids,
         "image_request_mode": detect_image_request_mode(base_url, ids) or normalize_image_request_mode(image_request_mode),
     }
+    return result
 
 @app.post("/api/providers/fetch-models")
 async def fetch_upstream_models_from_payload(payload: TestConnectionPayload):
     """按页面当前表单值拉取模型，支持新增平台未保存时直接使用临时 Base URL / Key。"""
     protocol = protocol_from_payload(payload)
     api_key = api_key_from_payload(payload, protocol)
-    return await fetch_models_from_upstream(payload.base_url, api_key, protocol, payload.image_request_mode)
+    # APIMart 协议：优先用 payload 携带的 image_generation_endpoint，其次查已保存 provider
+    # 同时校对协议：若已保存 provider 的协议与 payload 不一致，以已保存的为准
+    models_url_override = ""
+    if payload.provider_id:
+        try:
+            saved = next((p for p in load_api_providers() if p.get("id") == payload.provider_id), None)
+            if saved:
+                saved_protocol = str(saved.get("protocol") or "").strip().lower()
+                if saved_protocol and saved_protocol in SUPPORTED_PROVIDER_PROTOCOLS and saved_protocol != protocol:
+                    protocol = saved_protocol
+                if protocol == "apimart":
+                    payload_endpoint = str(getattr(payload, "image_generation_endpoint", "") or "").strip()
+                    if payload_endpoint:
+                        prefix = apimart_custom_prefix({"image_generation_endpoint": payload_endpoint})
+                    else:
+                        prefix = apimart_custom_prefix(saved)
+                    if prefix:
+                        models_url_override = f"{prefix}/models"
+        except Exception:
+            pass
+    return await fetch_models_from_upstream(payload.base_url, api_key, protocol, payload.image_request_mode, models_url_override)
 
 @app.get("/api/providers/{provider_id}/fetch-models")
 async def fetch_upstream_models(provider_id: str):
@@ -10984,7 +11067,13 @@ async def fetch_upstream_models(provider_id: str):
         api_key = os.getenv(provider_key_env(provider["id"]), "")
     if not api_key:
         raise HTTPException(status_code=400, detail=f"{provider.get('name') or provider_id} 未配置 API Key")
-    return await fetch_models_from_upstream(provider.get("base_url") or "", api_key, provider_protocol(provider), provider.get("image_request_mode") or "openai")
+    protocol = provider_protocol(provider)
+    models_url_override = ""
+    if protocol == "apimart":
+        prefix = apimart_custom_prefix(provider)
+        if prefix:
+            models_url_override = f"{prefix}/models"
+    return await fetch_models_from_upstream(provider.get("base_url") or "", api_key, protocol, provider.get("image_request_mode") or "openai", models_url_override)
 
 async def build_online_image_result(payload: OnlineImageRequest):
     provider = get_api_provider(payload.provider_id)

@@ -154,6 +154,20 @@ const RECOMMENDED_APIS = [
         video_models:['agnes-video-v2.0']
     },
     {
+        id:'cool',
+        name:'COOL (MJ API)',
+        base_url:'https://api.mjapi.cc.cd',
+        protocol:'apimart',
+        image_generation_endpoint:'/v1/cool/generate',
+        register_url:'https://api.mjapi.cc.cd/',
+        tagKeys:['api.tagImageModels','api.tagVideoModels'],
+        icons:['IMG','VID'],
+        summaryKey:'api.recommendCoolSummary',
+        advantages:['图片+视频模型丰富','Midjourney/Seedance等顶级模型','失败自动退款，按次计费'],
+        image_models:['gpt_image_2','seedream_4_5','nano_banana_2'],
+        video_models:['seedance_2_fast','seedance_2','wan_2_6','veo_3_1_fast']
+    },
+    {
         name:'FHL',
         base_url:'https://www.fhl.mom',
         protocol:'openai',
@@ -2102,7 +2116,13 @@ function renderRecommendApi(){
 }
 function recommendedProviderForApi(api){
     let item = providers.find(provider => String(provider.name || '').toLowerCase() === api.name.toLowerCase());
-    if(item) return item;
+    if(item){
+        item.image_generation_endpoint = api.image_generation_endpoint || item.image_generation_endpoint || '';
+        item.image_edit_endpoint = api.image_edit_endpoint || item.image_edit_endpoint || '';
+        item.protocol = api.protocol || item.protocol;
+        item.image_request_mode = normalizeImageRequestMode(api.image_request_mode);
+        return item;
+    }
     const baseId = normalizeId(api.id || api.name) || 'custom-api';
     let id = baseId;
     let suffix = 2;
@@ -2113,8 +2133,8 @@ function recommendedProviderForApi(api){
         base_url:api.base_url,
         protocol:api.protocol,
         image_request_mode:normalizeImageRequestMode(api.image_request_mode),
-        image_generation_endpoint:'',
-        image_edit_endpoint:'',
+        image_generation_endpoint:api.image_generation_endpoint || '',
+        image_edit_endpoint:api.image_edit_endpoint || '',
         enabled:true,
         primary:false,
         image_models:Array.isArray(api.image_models) ? [...api.image_models] : [],
@@ -2573,6 +2593,12 @@ function applyDetectedProtocol(protocol){
     const item = provider();
     const detected = String(protocol || '').toLowerCase();
     if(!item || !protocolInput || !['openai', 'apimart', 'gemini', 'volcengine', 'runninghub', 'jimeng'].includes(detected)) return false;
+    // 防护：若当前 provider 已是 apimart 异步协议（或有自定义生图端点），不允许被自动探测降级为 volcengine
+    const currentProto = String(item.protocol || '').toLowerCase();
+    const hasCustomEndpoint = !!(item.image_generation_endpoint || '').trim();
+    if(detected === 'volcengine' && (currentProto === 'apimart' || hasCustomEndpoint)){
+        return false;
+    }
     if(String(protocolInput.value || '').toLowerCase() === detected && String(item.protocol || '').toLowerCase() === detected) return false;
     protocolInput.value = detected;
     item.protocol = detected;
@@ -2725,7 +2751,8 @@ async function testConnection(){
                 api_key: apiKey,
                 provider_id: runninghubContext ? 'runninghub' : item.id,
                 protocol: runninghubContext ? 'runninghub' : (protocolInput?.value || 'openai'),
-                image_request_mode: imageRequestModeInput?.value || item.image_request_mode || 'openai'
+                image_request_mode: imageRequestModeInput?.value || item.image_request_mode || 'openai',
+                image_generation_endpoint: item.image_generation_endpoint || ''
             })
         }).then(async r => {
             if(!r.ok) throw new Error((await r.json()).detail || (tr('api.urlInvalid') || '验证失败'));
@@ -2792,7 +2819,8 @@ async function fetchModels(){
                 api_key:apiKey,
                 provider_id:runninghubContext ? 'runninghub' : item.id,
                 protocol:runninghubContext ? 'runninghub' : (protocolInput?.value || 'openai'),
-                image_request_mode:imageRequestModeInput?.value || item.image_request_mode || 'openai'
+                image_request_mode:imageRequestModeInput?.value || item.image_request_mode || 'openai',
+                image_generation_endpoint:item.image_generation_endpoint || ''
             })
         }).then(async r => {
             if(!r.ok) throw new Error((await r.json()).detail || (tr('api.urlInvalid') || '拉取失败'));
@@ -3229,8 +3257,8 @@ async function saveProviders(){
             item.chat_models = unique(item.chat_models || []);
             item.video_models = unique(item.video_models || []);
         }
-        item.image_generation_endpoint = '';
-        item.image_edit_endpoint = '';
+        item.image_generation_endpoint = item.image_generation_endpoint || '';
+        item.image_edit_endpoint = item.image_edit_endpoint || '';
         item.image_models = unique(item.image_models || []);
         item.chat_models = unique(item.chat_models || []);
         item.video_models = unique(item.video_models || []);

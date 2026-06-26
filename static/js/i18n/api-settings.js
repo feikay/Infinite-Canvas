@@ -163,6 +163,7 @@
         "api.recommendLingjingDiscount": { zh: "六折", en: "40% off" },
         "api.recommendAgnesSummary": { zh: "免费可用的 Agnes AI 接口，支持图像与视频生成，适合快速测试和低成本接入。", en: "Free Agnes AI API for image and video generation, suitable for quick testing and low-cost setup." },
         "api.recommendAgnesFree": { zh: "免费", en: "Free" },
+        "api.recommendCoolSummary": { zh: "COOL (MJ API) 网关提供 Midjourney、Seedance、Kling、Wan 等顶级图像与视频模型，按次计费，失败自动退款。", en: "COOL (MJ API) gateway provides top-tier image & video models including Midjourney, Seedance, Kling, Wan, with pay-per-use billing and automatic refunds on failure." },
         "api.recommendFeatured": { zh: "首选推荐", en: "Top Pick" },
         "api.tagImageModels": { zh: "图像模型", en: "Image Models" },
         "api.tagVideoModels": { zh: "视频模型", en: "Video Models" },
